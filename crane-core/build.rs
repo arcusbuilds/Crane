@@ -24,6 +24,39 @@ fn oneapi_runtime_dirs() -> Vec<String> {
 }
 
 fn main() {
+
+    #[cfg(feature = "flash-attn")]
+    {
+        use std::path::PathBuf;
+        let headers = std::env::var_os("CRANE_FLASH_ATTN_HEADERS").map(PathBuf::from).unwrap_or_else(|| {
+            let cargo_cache = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("HOME").expect("HOME or CARGO_HOME required")).join(".cargo")
+            });
+            std::fs::read_dir(cargo_cache.join("registry/src")).expect("Cargo registry source directory")
+                .filter_map(|entry|entry.ok().map(|e|e.path().join("candle-flash-attn-0.11.0/kernels")))
+                .find(|path|path.join("flash_fwd_launch_template.h").is_file())
+                .expect("unmodified candle-flash-attn 0.11.0 headers; or set CRANE_FLASH_ATTN_HEADERS")
+        });
+        println!("cargo::rerun-if-env-changed=CRANE_FLASH_ATTN_HEADERS");
+        println!("cargo::rerun-if-changed=kernels/flash_split/");
+        let out=PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+        cudaforge::KernelBuilder::new()
+            .source_files(["kernels/flash_split/launch.cu"])
+            .out_dir(&out)
+            .with_cutlass(Some("7d49e6c7e2f8896c47f586706e67e1fb215529dc"))
+            .arg(&format!("-I{}",headers.display()))
+            .arg("-std=c++17").arg("-O3").arg("--fmad=true")
+            .arg("--expt-relaxed-constexpr").arg("--expt-extended-lambda")
+            .arg("-U__CUDA_NO_HALF_OPERATORS__").arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+            .arg("-U__CUDA_NO_HALF2_OPERATORS__").arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+            .arg("-Xcompiler").arg("-fPIC")
+            .build_lib(out.join("libcrane_flash_split.a")).expect("build Crane split-KV launcher");
+        println!("cargo::rustc-link-search=native={}",out.display());
+        println!("cargo::rustc-link-lib=static=crane_flash_split");
+        println!("cargo::rustc-link-lib=dylib=cudart");
+        println!("cargo::rustc-link-lib=dylib=stdc++");
+    }
+
     println!("cargo::rerun-if-changed=kernels/cuda/");
     println!("cargo::rerun-if-changed=kernels/sycl/");
     // The Metal kernels in `kernels/metal/fused_ops.metal` are `include_str!`'d

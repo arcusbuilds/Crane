@@ -55,6 +55,12 @@ impl PatchEmbed {
         let width = self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size;
         let dtype = self.bias.dtype();
         let xs = xs.reshape(((), width))?.to_dtype(dtype)?;
+        #[cfg(feature = "cudnn")]
+        if xs.device().is_cuda() && dtype == DType::BF16 {
+            let patches=xs.reshape((xs.dim(0)?,self.in_channels,self.temporal_patch_size,self.patch_size,self.patch_size))?.to_dtype(DType::F32)?;
+            let weight=self.proj.reshape((self.hidden_size,self.in_channels,self.temporal_patch_size,self.patch_size,self.patch_size))?.to_dtype(DType::F32)?;
+            return crate::ops::patch_conv3d::full_patch_conv3d(&patches,&weight)?.to_dtype(dtype)?.broadcast_add(&self.bias.unsqueeze(0)?);
+        }
         let xs = xs.matmul(&self.proj.t()?)?;
         // ATen adds Conv3d bias after cuDNN rounds the convolution output.
         xs.to_dtype(dtype)?.broadcast_add(&self.bias.unsqueeze(0)?)
@@ -171,13 +177,14 @@ impl VisionAttention {
                 let flash =
                     if xs.device().is_cuda() && matches!(xs.dtype(), DType::BF16 | DType::F16) {
                         Some(
-                            candle_flash_attn::flash_attn(
-                                &q.to_dtype(xs.dtype())?.transpose(1, 2)?.contiguous()?,
-                                &k.to_dtype(xs.dtype())?.transpose(1, 2)?.contiguous()?,
-                                &v.to_dtype(xs.dtype())?.transpose(1, 2)?.contiguous()?,
-                                scale as f32,
-                                false,
-                            )?
+                            {
+                                let fq=q.to_dtype(xs.dtype())?.transpose(1,2)?.contiguous()?;
+                                let fk=k.to_dtype(xs.dtype())?.transpose(1,2)?.contiguous()?;
+                                let fv=v.to_dtype(xs.dtype())?.transpose(1,2)?.contiguous()?;
+                                if xs.dtype()==DType::BF16 && self.head_dim==64 {
+                                    crate::ops::flash_split::noncausal_bf16_64(&fq,&fk,&fv)
+                                } else {candle_flash_attn::flash_attn(&fq,&fk,&fv,scale as f32,false)}
+                            }?
                             .transpose(1, 2)?
                             .to_dtype(DType::F32)?,
                         )
@@ -243,10 +250,10 @@ impl VisionBlock {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
-        let normed = self.norm1.forward(xs)?;
+        let normed = crate::ops::float_math::layer_norm::forward(&self.norm1, xs)?;
         let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin)?;
         let xs_att = xs.add(&attn_out)?;
-        let mlp_out = self.mlp.forward(&self.norm2.forward(&xs_att)?)?;
+        let mlp_out = self.mlp.forward(&crate::ops::float_math::layer_norm::forward(&self.norm2, &xs_att)?)?;
         xs_att.add(&mlp_out)
     }
 }
@@ -297,7 +304,7 @@ impl PatchMerger {
         } else {
             xs.clone()
         };
-        let normed = self.norm.forward(&norm_input)?;
+        let normed = crate::ops::float_math::layer_norm::forward(&self.norm, &norm_input)?;
         let reshaped = if self.use_postshuffle_norm {
             normed
         } else {

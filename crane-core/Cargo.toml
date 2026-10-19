@@ -148,7 +148,7 @@ cuda = [
     "dep:bindgen_cuda",
 ]
 cudnn = ["candle-core-default/cudnn"]
-flash-attn = ["cuda", "dep:candle-flash-attn"]
+flash-attn = ["cuda", "dep:candle-flash-attn", "dep:cudaforge"]
 # AMD ROCm/HIP backend (experimental fork). Also enables the fork's own
 # `rocm` feature — it's off by default there too. Build with
 # `--no-default-features`: this crate's `default` feature pulls in the
@@ -190,5 +190,6 @@ criterion = { version = "0.8", features = ["html_reports"] }
 hound = "3"
 
 [build-dependencies]
+cudaforge = { version = "0.1.6", optional = true }
 bindgen_cuda = { version = "0.1.6", optional = true }
 prost-build = { version = "0.14.3", optional = true }

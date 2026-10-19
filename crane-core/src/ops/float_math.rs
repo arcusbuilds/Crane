@@ -177,3 +177,6 @@ fn cuda_rms_norm(x: &Tensor, alpha: Option<&Tensor>, eps: f32) -> Result<Tensor>
         false,
     ))
 }
+
+#[path = "float_math/layer_norm.rs"]
+pub mod layer_norm;

@@ -690,13 +690,14 @@ impl FullAttention {
             && matches!(q.dtype(), DType::BF16 | DType::F16)
         {
             Some(
-                candle_flash_attn::flash_attn(
-                    &q.transpose(1, 2)?.contiguous()?,
-                    &k.transpose(1, 2)?.contiguous()?,
-                    &v.transpose(1, 2)?.contiguous()?,
-                    scale as f32,
-                    true,
-                )?
+                {
+                    let fq=q.transpose(1,2)?.contiguous()?;
+                    let fk=k.transpose(1,2)?.contiguous()?;
+                    let fv=v.transpose(1,2)?.contiguous()?;
+                    if q.dtype()==DType::BF16 && self.head_dim==256 && fq.dim(1)?==fk.dim(1)? {
+                        crate::ops::flash_split::causal_bf16_256_auto(&fq,&fk,&fv)
+                    } else {candle_flash_attn::flash_attn(&fq,&fk,&fv,scale as f32,true)}
+                }?
                 .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?,
             )
         } else {

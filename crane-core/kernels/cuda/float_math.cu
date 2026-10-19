@@ -64,3 +64,48 @@ extern "C" __global__ void prefix_scan_f32(
         __syncthreads();
     }
 }
+
+// Ordered vector-four Welford reduction for CUDA inference.
+struct NormStats { float mean, m2, n; };
+__device__ NormStats norm_combine(NormStats b, NormStats a) {
+    float n=__fadd_rn(a.n,b.n);
+    if(n==0.f) return {0.f,0.f,0.f};
+    float delta=__fsub_rn(b.mean,a.mean), inv=__frcp_rn(n);
+    float na=__fmul_rn(a.n,inv), nb=__fmul_rn(b.n,inv);
+    float mean=__fmaf_rn(na,a.mean,__fmul_rn(nb,b.mean));
+    float cross=__fmul_rn(__fmul_rn(delta,delta),a.n);
+    return {mean,__fmaf_rn(cross,nb,__fadd_rn(a.m2,b.m2)),n};
+}
+extern "C" __global__ void layer_norm_f32_welford(
+    const float* x,const float* gamma,const float* beta,float* out,
+    unsigned int width,float eps) {
+    __shared__ NormStats stats[4];
+    unsigned int tid=threadIdx.x,lane=tid%32,warp=tid/32,row=blockIdx.x;
+    NormStats s={0.f,0.f,0.f};
+    for(unsigned int c=tid*4;c<width;c+=512) {
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            float v=x[row*width+c+j],delta=__fsub_rn(v,s.mean);
+            s.n=__fadd_rn(s.n,1.f);
+            s.mean=__fmaf_rn(delta,__frcp_rn(s.n),s.mean);
+            s.m2=__fmaf_rn(delta,__fsub_rn(v,s.mean),s.m2);
+        }
+    }
+    for(int offset=16;offset;offset/=2) {
+        NormStats b={__shfl_down_sync(0xffffffff,s.mean,offset),
+                     __shfl_down_sync(0xffffffff,s.m2,offset),
+                     __shfl_down_sync(0xffffffff,s.n,offset)};
+        s=norm_combine(s,b);
+    }
+    if(lane==0) stats[warp]=s;
+    __syncthreads();
+    for(int offset=2;offset;offset/=2) {
+        if(lane==0 && warp<unsigned(offset)) stats[warp]=norm_combine(stats[warp],stats[warp+offset]);
+        __syncthreads();
+    }
+    float mean=stats[0].mean,inv=rsqrtf(__fadd_rn(__fdiv_rn(stats[0].m2,float(width)),eps));
+    for(unsigned int c=tid;c<width;c+=128) {
+        float normalized=__fmul_rn(inv,__fsub_rn(x[row*width+c],mean));
+        out[row*width+c]=__fmaf_rn(gamma[c],normalized,beta[c]);
+    }
+}

@@ -18,10 +18,15 @@
 pub mod arg_reduce;
 pub mod biased_linear;
 pub mod float_math;
+#[cfg(feature = "cudnn")]
+pub mod patch_conv3d;
+#[cfg(feature = "flash-attn")]
+pub mod flash_split;
 pub mod fused_ops;
 pub mod gdn;
 pub mod hyper_connection;
 pub mod linear;
+pub mod linear_no_bias;
 #[cfg(feature = "metal")]
 pub mod metal_util;
 #[cfg(feature = "cuda")]
