@@ -24,7 +24,9 @@ pub struct GdnLayerCache {
     /// Run the next forward's recurrence on the serial kernel even for
     /// `seq_len > 1` (short speculative-decoding blocks; see `fused_recurrence`).
     pub prefer_serial: bool,
-    /// Opt-in fused causal-conv/FLA input rounding for current Transformers.
+    /// Current Transformers causal-conv/FLA rounding. Enabled by default for
+    /// CUDA BF16; `CRANE_GDN_FLA=0` or setting this field to false restores
+    /// the legacy path. Other devices/dtypes keep their existing defaults.
     pub fla_numerics: bool,
 }
 
@@ -51,7 +53,9 @@ impl GdnLayerCache {
             checkpoint_at: None,
             checkpoint: None,
             prefer_serial: false,
-            fla_numerics: false,
+            fla_numerics: dtype == DType::BF16
+                && device.is_cuda()
+                && std::env::var("CRANE_GDN_FLA").map_or(true, |v| v != "0"),
         })
     }
 

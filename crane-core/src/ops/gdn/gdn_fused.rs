@@ -33,14 +33,12 @@ pub fn supported(x: &Tensor, dims: &GdnDims) -> bool {
         && x.dtype() == DType::BF16
         && x.dim(0).is_ok_and(|b| b == 1)
         && x.dim(1).is_ok_and(|s| {
-            s > 1
-                || (s == 1
-                    && std::env::var("CRANE_GDN_FUSED").is_ok_and(|v| v == "1")
-                    && std::env::var("CRANE_GDN_PORTABLE").is_err())
+            s > 1 || (s == 1 && std::env::var("CRANE_GDN_FUSED").is_ok_and(|v| v == "1"))
         })
         && dims.head_k_dim == HEAD_DIM
         && dims.head_v_dim == HEAD_DIM
         && dims.conv_kernel_size == CONV_K
+        && std::env::var("CRANE_GDN_PORTABLE").is_err()
         && std::env::var("CRANE_GDN_FUSED").map_or(true, |v| v != "0")
 }
 
@@ -326,6 +324,8 @@ pub fn prep_with_numerics(
     bl.arg(&scale);
     let modern = i32::from(fla_numerics);
     bl.arg(&modern);
+    let decode = i32::from(conv.dim(0)? == 1);
+    bl.arg(&decode);
     let cfg = LaunchConfig {
         grid_dim: (len as u32, h.div_ceil(WARPS) as u32, 1),
         block_dim: (32 * WARPS as u32, 1, 1),

@@ -343,6 +343,26 @@ fn serial_max() -> usize {
     })
 }
 
+/// Shared dispatch policy for both native FLA and the legacy chunk recurrence.
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "sycl",
+    feature = "metal"
+))]
+pub(super) fn use_chunked_recurrence(
+    device: &candle_core::Device,
+    seq_len: usize,
+    cache: &GdnLayerCache,
+) -> bool {
+    let chunked_ok = !device.is_metal() || std::env::var("CRANE_GDN_CHUNKED").is_ok();
+    seq_len > 1
+        && chunked_ok
+        && !cache.prefer_serial
+        && seq_len > serial_max()
+        && std::env::var("CRANE_GDN_SERIAL_PREFILL").is_err()
+}
+
 /// Prepare tensors and launch the fused recurrence kernel.
 ///
 /// Lays inputs out as the kernel expects (`[BH, S, *]`, contiguous f32),
@@ -471,12 +491,7 @@ pub(super) fn recurrence_prepped(
     // at every length (2.5-2.8x per GDN layer from 64 to 4096 tokens on an M3
     // Pro, see `tests/gdn_fused.rs`), so there the chunked path is opt-in
     // (`CRANE_GDN_CHUNKED=1`).
-    let chunked_ok = !q3.device().is_metal() || std::env::var("CRANE_GDN_CHUNKED").is_ok();
-    let use_chunked = seq_len > 1
-        && chunked_ok
-        && !cache.prefer_serial
-        && seq_len > serial_max()
-        && std::env::var("CRANE_GDN_SERIAL_PREFILL").is_err();
+    let use_chunked = use_chunked_recurrence(q3.device(), seq_len, cache);
     let (y, state_out) = timed(Span::GdnLaunch, || {
         if use_chunked {
             if dtype == DType::BF16 {

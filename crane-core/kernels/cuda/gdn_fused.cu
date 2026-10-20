@@ -102,13 +102,16 @@ extern "C" __global__ void gdn_conv_silu_bf16(
 // Candle's L2 norm for bf16 inputs, per 128-wide row, one warp per row: squares
 // rounded to bf16 individually, four lane-local accumulators (elements
 // lane + 32 j), warp tree reduce, eps added to the *sum*.
-__device__ __forceinline__ void l2_row(const float (&v)[4], float (&out)[4], bool modern) {
+__device__ __forceinline__ void l2_row(const float (&v)[4], float (&out)[4], bool modern, bool decode) {
     float p[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) p[j] = modern ? __fmul_rn(v[j], v[j]) : bf16_round(v[j] * v[j]);
-    float sum = __fadd_rn(__fadd_rn(__fadd_rn(p[0], p[1]), p[2]), p[3]);
+    // Match current single-token Candle normalization; keep prefill arithmetic unchanged.
+    float sum = modern && decode ? __fadd_rn(__fadd_rn(p[0], p[2]), __fadd_rn(p[1], p[3]))
+                       : __fadd_rn(__fadd_rn(__fadd_rn(p[0], p[1]), p[2]), p[3]);
     for (int off = 16; off > 0; off >>= 1) sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, off));
-    float inv = rsqrtf(__fadd_rn(__shfl_sync(0xffffffff, sum, 0), 1e-6f));
+    float denom = __fadd_rn(__shfl_sync(0xffffffff, sum, 0), 1e-6f);
+    float inv = modern && decode ? __frcp_rn(__fsqrt_rn(denom)) : rsqrtf(denom);
 #pragma unroll
     for (int j = 0; j < 4; ++j) out[j] = modern ? bf16_round(__fmul_rn(v[j], inv)) : v[j] * inv;
 }
@@ -125,7 +128,7 @@ extern "C" __global__ void gdn_prep_bf16(
     const float* __restrict__ dt_bias, float* __restrict__ q3, float* __restrict__ k3,
     float* __restrict__ v3, float* __restrict__ g2, float* __restrict__ beta2,
     int t0, int len, int H, int num_k, int vpg, int order, int key_dim, int C, int as_,
-    int bs_, float scale, int fla_numerics) {
+    int bs_, float scale, int fla_numerics, int decode) {
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps = blockDim.x >> 5;
@@ -146,8 +149,8 @@ extern "C" __global__ void gdn_prep_bf16(
         qv[j] = __bfloat162float(qrow[lane + 32 * j]);
         kv[j] = __bfloat162float(krow[lane + 32 * j]);
     }
-    l2_row(qv, qn, fla_numerics != 0);
-    l2_row(kv, kn, fla_numerics != 0);
+    l2_row(qv, qn, fla_numerics != 0, decode != 0);
+    l2_row(kv, kn, fla_numerics != 0, decode != 0);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         q3[out_row + lane + 32 * j] = __fmul_rn(qn[j], scale);

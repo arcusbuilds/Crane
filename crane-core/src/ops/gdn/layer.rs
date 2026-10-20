@@ -305,8 +305,6 @@ impl GatedDeltaNet {
         if let Some(fused) = &self.derived.fused
             && projected.mixed_qkv.is_some()
             && gf::supported(x, dims)
-            // Decode fusion preserves the legacy BF16 rounding points.
-            && (seq_len != 1 || !x.device().is_cuda() || !cache.fla_numerics)
         {
             let out = self.forward_fused(&projected, fused, dims, cache, split)?;
             if ckpt.is_some_and(|p| p >= seq_len) {
@@ -483,6 +481,7 @@ impl GatedDeltaNet {
             #[cfg(feature = "cuda")]
             {
                 if seq_len == 1 {
+                    // Preserve main's S=1 BF16 rounding; FLA prefill uses its own profile.
                     return gf::decode_conv_silu(&x2, &state, &fused.conv_w);
                 }
                 gf::conv_silu_with_numerics(&x2, &state, &fused.conv_w, split, cache.fla_numerics)
@@ -495,7 +494,8 @@ impl GatedDeltaNet {
         cache.conv_state = conv.state.clone();
 
         #[cfg(feature = "cuda")]
-        if cache.fla_numerics {
+        if cache.fla_numerics && super::backend::use_chunked_recurrence(x2.device(), seq_len, cache)
+        {
             let segments = match split {
                 Some(p) => vec![(0, p), (p, seq_len - p)],
                 None => vec![(0, seq_len)],
@@ -506,23 +506,45 @@ impl GatedDeltaNet {
                     let conv_state = conv.ckpt.take().expect("conv checkpoint for split prefill");
                     cache.checkpoint = Some((conv_state, cache.recurrent_state.copy()?));
                 }
-                let mixed = conv.y.narrow(0, t0, len)?.reshape((1, len, dims.conv_dim))?;
+                let mixed = conv
+                    .y
+                    .narrow(0, t0, len)?
+                    .reshape((1, len, dims.conv_dim))?;
                 let (q, k, v) = split_qkv(&mixed, dims, 1, len)?;
+                // FLA groups adjacent value-head replicas (HF ordering).
+                // GGUF keeps whole key-head passes together; materialize its
+                // Q/K mapping before FLA so both checkpoint layouts work.
+                let (q, k) = if dims.v_head_order == VHeadOrder::Chunked {
+                    repeat_kv_heads(&q, &k, dims)?
+                } else {
+                    (q, k)
+                };
                 let (beta, g) = compute_beta_g(
                     &projected.b.narrow(1, t0, len)?,
                     &projected.a.narrow(1, t0, len)?,
                     &self.derived.gates,
                     act,
                 )?;
-                let (y, state) = super::chunked_fla::forward(
-                    &q, &k, &v, &g, &beta, &cache.recurrent_state,
-                )?;
+                let (y, state) =
+                    super::chunked_fla::forward(&q, &k, &v, &g, &beta, &cache.recurrent_state)?;
                 cache.recurrent_state = state;
                 let y = y.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
-                gf::post_norm(&out_buf, &y, &projected.z, &fused.norm_w, self.norm.eps(), t0, len, h)?;
+                gf::post_norm(
+                    &out_buf,
+                    &y,
+                    &projected.z,
+                    &fused.norm_w,
+                    self.norm.eps(),
+                    t0,
+                    len,
+                    h,
+                )?;
             }
-            let out = gf::post_out_tensor(out_buf, &x2, seq_len, h)?
-                .reshape((1, seq_len, dims.value_dim))?;
+            let out = gf::post_out_tensor(out_buf, &x2, seq_len, h)?.reshape((
+                1,
+                seq_len,
+                dims.value_dim,
+            ))?;
             return timed(Span::GdnFinish, || self.out_proj.forward(&out));
         }
 
