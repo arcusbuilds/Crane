@@ -25,7 +25,7 @@ fn oneapi_runtime_dirs() -> Vec<String> {
 
 fn main() {
 
-    #[cfg(feature = "flash-attn")]
+    #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
     {
         use std::path::PathBuf;
         let headers = std::env::var_os("CRANE_FLASH_ATTN_HEADERS").map(PathBuf::from).unwrap_or_else(|| {
@@ -38,10 +38,10 @@ fn main() {
                 .expect("unmodified candle-flash-attn 0.11.0 headers; or set CRANE_FLASH_ATTN_HEADERS")
         });
         println!("cargo::rerun-if-env-changed=CRANE_FLASH_ATTN_HEADERS");
-        println!("cargo::rerun-if-changed=kernels/flash_split/");
+        println!("cargo::rerun-if-changed=kernels/cuda/flash_attention/");
         let out=PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
         cudaforge::KernelBuilder::new()
-            .source_files(["kernels/flash_split/launch.cu"])
+            .source_files(["kernels/cuda/flash_attention/launch.cu"])
             .out_dir(&out)
             .with_cutlass(Some("7d49e6c7e2f8896c47f586706e67e1fb215529dc"))
             .arg(&format!("-I{}",headers.display()))
@@ -84,8 +84,11 @@ fn main() {
 
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+        // Top-level CUDA sources are embedded PTX kernels. Subdirectories
+        // contain separately built host launch adapters, such as FlashAttention,
+        // which must not be compiled through the PTX-only pipeline.
         let builder = bindgen_cuda::Builder::default()
-            .kernel_paths_glob("kernels/cuda/**/*.cu")
+            .kernel_paths_glob("kernels/cuda/*.cu")
             .arg("--expt-relaxed-constexpr")
             .arg("-std=c++17")
             .arg("-O3");

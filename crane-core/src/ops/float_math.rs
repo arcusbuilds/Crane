@@ -1,5 +1,6 @@
 //! Float32 transcendental helpers with explicit rounding boundaries.
 use candle_core::{DType, Result, Tensor};
+pub mod inference;
 mod scan;
 pub use scan::cumsum_last_dim;
 #[cfg(feature = "cuda")]
@@ -169,7 +170,18 @@ fn cuda_rms_norm(x: &Tensor, alpha: Option<&Tensor>, eps: f32) -> Result<Tensor>
     builder.arg(&eps);
     // SAFETY: one warp owns each contiguous row; all tensor guards remain
     // alive through launch and alpha is either null or width F32 values.
-    unsafe { builder.launch(LaunchConfig::for_num_elems(rows * 32)) }.w()?;
+    // A warp owns one row. Small text prefills need enough blocks to fill
+    // the GPU rather than grouping 32 rows into each 1024-thread block.
+    let cfg = if width == 2048 && rows <= 256 {
+        LaunchConfig {
+            grid_dim: (rows, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    } else {
+        LaunchConfig::for_num_elems(rows * 32)
+    };
+    unsafe { builder.launch(cfg) }.w()?;
     Ok(Tensor::from_storage(
         Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev)),
         x.shape().clone(),
@@ -180,3 +192,154 @@ fn cuda_rms_norm(x: &Tensor, alpha: Option<&Tensor>, eps: f32) -> Result<Tensor>
 
 #[path = "float_math/layer_norm.rs"]
 pub mod layer_norm;
+
+/// Ordered F32 RMS arithmetic with low-precision input/output and an F32
+/// scale. This is exactly the cast -> F32 normalize/scale -> cast graph.
+pub fn rms_norm_low_precision(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
+    let width = x.dim(candle_core::D::Minus1)?;
+    if !matches!(x.dtype(), DType::BF16 | DType::F16)
+        || alpha.dtype() != DType::F32
+        || alpha.dims() != [width]
+        || !alpha.device().same_device(x.device())
+    {
+        candle_core::bail!(
+            "low-precision ordered RMS requires BF16/F16 input and an F32 width-sized scale"
+        );
+    }
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() && width > 0 && width % 128 == 0 {
+        return match x.dtype() {
+            DType::BF16 => cuda_rms_low::<half::bf16>(x, alpha, eps, "rms_norm_bf16_ordered"),
+            DType::F16 => cuda_rms_low::<half::f16>(x, alpha, eps, "rms_norm_f16_ordered"),
+            _ => unreachable!(),
+        };
+    }
+    rms_norm(&x.to_dtype(DType::F32)?, Some(alpha), eps)?.to_dtype(x.dtype())
+}
+#[cfg(feature = "cuda")]
+fn cuda_rms_low<
+    T: candle_core::cuda_backend::CudaDType
+        + candle_core::WithDType
+        + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+>(
+    x: &Tensor,
+    alpha: &Tensor,
+    eps: f32,
+    name: &str,
+) -> Result<Tensor> {
+    use candle_core::cuda_backend::{
+        WrapErr,
+        cudarc::driver::{LaunchConfig, PushKernelArg},
+    };
+    use candle_core::{CudaStorage, Storage, op::BackpropOp};
+    let x = x.contiguous()?;
+    let alpha = alpha.contiguous()?;
+    let width = u32::try_from(x.dim(candle_core::D::Minus1)?).map_err(candle_core::Error::wrap)?;
+    let count = u32::try_from(x.elem_count()).map_err(candle_core::Error::wrap)?;
+    let rows = count / width;
+    if rows == 0 {
+        return Ok(x);
+    }
+    let dev = x.device().as_cuda_device()?.clone();
+    let (xs, xl) = x.storage_and_layout();
+    let (as_, al) = alpha.storage_and_layout();
+    let Storage::Cuda(xs) = &*xs else {
+        unreachable!()
+    };
+    let Storage::Cuda(as_) = &*as_ else {
+        unreachable!()
+    };
+    let xv = xs.as_cuda_slice::<T>()?.slice(xl.start_offset()..);
+    let av = as_.as_cuda_slice::<f32>()?.slice(al.start_offset()..);
+    let mut out = unsafe { dev.alloc::<T>(count as usize) }?;
+    let fun = dev.get_or_load_custom_func(name, "crane_float_math", ptx::FLOAT_MATH)?;
+    let mut b = fun.builder();
+    b.arg(&xv)
+        .arg(&av)
+        .arg(&mut out)
+        .arg(&rows)
+        .arg(&width)
+        .arg(&eps);
+    let cfg = if width == 2048 && rows <= 256 {
+        LaunchConfig {
+            grid_dim: (rows, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    } else {
+        LaunchConfig::for_num_elems(rows * 32)
+    };
+    unsafe { b.launch(cfg) }.w()?;
+    Ok(Tensor::from_storage(
+        Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev)),
+        x.shape().clone(),
+        BackpropOp::none(),
+        false,
+    ))
+}
+
+pub fn swiglu_low_precision(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if !matches!(gate.dtype(), DType::BF16 | DType::F16)
+        || up.dtype() != gate.dtype()
+        || up.dims() != gate.dims()
+        || !up.device().same_device(gate.device())
+    {
+        candle_core::bail!("low-precision SwiGLU requires matching BF16/F16 tensors");
+    }
+    #[cfg(feature = "cuda")]
+    if gate.device().is_cuda() {
+        return match gate.dtype() {
+            DType::BF16 => cuda_swiglu_low::<half::bf16>(gate, up, "swiglu_bf16_ordered"),
+            DType::F16 => cuda_swiglu_low::<half::f16>(gate, up, "swiglu_f16_ordered"),
+            _ => unreachable!(),
+        };
+    }
+    gate.to_dtype(DType::F32)?
+        .silu()?
+        .to_dtype(gate.dtype())?
+        .mul(up)
+}
+#[cfg(feature = "cuda")]
+fn cuda_swiglu_low<
+    T: candle_core::cuda_backend::CudaDType
+        + candle_core::WithDType
+        + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+>(
+    gate: &Tensor,
+    up: &Tensor,
+    name: &str,
+) -> Result<Tensor> {
+    use candle_core::cuda_backend::{
+        WrapErr,
+        cudarc::driver::{LaunchConfig, PushKernelArg},
+    };
+    use candle_core::{CudaStorage, Storage, op::BackpropOp};
+    let gate = gate.contiguous()?;
+    let up = up.contiguous()?;
+    let n = u32::try_from(gate.elem_count()).map_err(candle_core::Error::wrap)?;
+    if n == 0 {
+        return Ok(gate);
+    }
+    let dev = gate.device().as_cuda_device()?.clone();
+    let (gs, gl) = gate.storage_and_layout();
+    let (us, ul) = up.storage_and_layout();
+    let Storage::Cuda(gs) = &*gs else {
+        unreachable!()
+    };
+    let Storage::Cuda(us) = &*us else {
+        unreachable!()
+    };
+    let gv = gs.as_cuda_slice::<T>()?.slice(gl.start_offset()..);
+    let uv = us.as_cuda_slice::<T>()?.slice(ul.start_offset()..);
+    let mut out = unsafe { dev.alloc::<T>(n as usize) }?;
+    let f = dev.get_or_load_custom_func(name, "crane_float_math", ptx::FLOAT_MATH)?;
+    let mut b = f.builder();
+    b.arg(&gv).arg(&uv).arg(&mut out).arg(&n);
+    unsafe { b.launch(LaunchConfig::for_num_elems(n)) }.w()?;
+    Ok(Tensor::from_storage(
+        Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev)),
+        gate.shape().clone(),
+        BackpropOp::none(),
+        false,
+    ))
+}

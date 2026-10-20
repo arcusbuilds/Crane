@@ -213,6 +213,7 @@ mod tests {
             checkpoint_at: None,
             checkpoint: None,
             prefer_serial: false,
+            fla_numerics: false,
         }
     }
 

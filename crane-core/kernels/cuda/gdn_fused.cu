@@ -40,7 +40,7 @@ extern "C" __global__ void gdn_conv_silu_bf16(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ state,
     const float* __restrict__ w, __nv_bfloat16* __restrict__ y,
     __nv_bfloat16* __restrict__ new_state, __nv_bfloat16* __restrict__ ckpt,
-    int S, int C, int xs, int ckpt_at) {
+    int S, int C, int xs, int ckpt_at, int fla_numerics) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float wk[GDN_CONV_K];
@@ -53,14 +53,35 @@ extern "C" __global__ void gdn_conv_silu_bf16(
     };
 
     float win[GDN_CONV_K];  // hidden[t + 1 .. t + K]
+    // Modern fresh-prefill profile: parallelize tokens as well as channels.
+    // Four ordered taps preserve the extension's FMA and fast-SiLU rounding.
+    if (fla_numerics) {
+        const int t = blockIdx.y;
+        float acc = __fmul_rn(hidden(t + 1), wk[0]);
+#pragma unroll
+        for (int j = 1; j < GDN_CONV_K; ++j)
+            acc = __fmaf_rn(hidden(t + 1 + j), wk[j], acc);
+        y[(size_t)t * C + c] = __float2bfloat16_rn(__fdividef(acc, 1.0f + __expf(-acc)));
+        if (t == 0) {
+#pragma unroll
+            for (int j = 0; j < GDN_CONV_K; ++j)
+                new_state[c * GDN_CONV_K + j] = __float2bfloat16_rn(hidden(S + j));
+            if (ckpt != nullptr) {
+#pragma unroll
+                for (int j = 0; j < GDN_CONV_K; ++j)
+                    ckpt[c * GDN_CONV_K + j] = __float2bfloat16_rn(hidden(ckpt_at + j));
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int j = 0; j < GDN_CONV_K; ++j) win[j] = hidden(1 + j);
     for (int t = 0; t < S; ++t) {
         float acc = __fmul_rn(win[0], wk[0]);
 #pragma unroll
-        for (int j = 1; j < GDN_CONV_K; ++j) acc = __fadd_rn(acc, __fmul_rn(win[j], wk[j]));
-        float r = bf16_round(acc);  // .to_dtype(bf16) before the activation
-        y[(size_t)t * C + c] = __float2bfloat16_rn(silu_f32(r));
+        for (int j = 1; j < GDN_CONV_K; ++j) acc = fla_numerics ? __fmaf_rn(win[j], wk[j], acc) : __fadd_rn(acc, __fmul_rn(win[j], wk[j]));
+        float r = fla_numerics ? acc : bf16_round(acc);  // .to_dtype(bf16) before the activation
+        y[(size_t)t * C + c] = __float2bfloat16_rn(fla_numerics ? __fdividef(r, 1.0f + __expf(-r)) : silu_f32(r));
         // Slide the window to hidden[t + 2 .. t + K + 1]; the last step has no
         // next output, so don't read past the end of x.
 #pragma unroll
@@ -81,15 +102,15 @@ extern "C" __global__ void gdn_conv_silu_bf16(
 // Candle's L2 norm for bf16 inputs, per 128-wide row, one warp per row: squares
 // rounded to bf16 individually, four lane-local accumulators (elements
 // lane + 32 j), warp tree reduce, eps added to the *sum*.
-__device__ __forceinline__ void l2_row(const float (&v)[4], float (&out)[4]) {
+__device__ __forceinline__ void l2_row(const float (&v)[4], float (&out)[4], bool modern) {
     float p[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) p[j] = bf16_round(v[j] * v[j]);
+    for (int j = 0; j < 4; ++j) p[j] = modern ? __fmul_rn(v[j], v[j]) : bf16_round(v[j] * v[j]);
     float sum = __fadd_rn(__fadd_rn(__fadd_rn(p[0], p[1]), p[2]), p[3]);
     for (int off = 16; off > 0; off >>= 1) sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, off));
     float inv = rsqrtf(__fadd_rn(__shfl_sync(0xffffffff, sum, 0), 1e-6f));
 #pragma unroll
-    for (int j = 0; j < 4; ++j) out[j] = v[j] * inv;
+    for (int j = 0; j < 4; ++j) out[j] = modern ? bf16_round(__fmul_rn(v[j], inv)) : v[j] * inv;
 }
 
 // Grid: (len, ceil(H / warps), 1); each warp owns one (t, value head).
@@ -104,7 +125,7 @@ extern "C" __global__ void gdn_prep_bf16(
     const float* __restrict__ dt_bias, float* __restrict__ q3, float* __restrict__ k3,
     float* __restrict__ v3, float* __restrict__ g2, float* __restrict__ beta2,
     int t0, int len, int H, int num_k, int vpg, int order, int key_dim, int C, int as_,
-    int bs_, float scale) {
+    int bs_, float scale, int fla_numerics) {
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps = blockDim.x >> 5;
@@ -125,8 +146,8 @@ extern "C" __global__ void gdn_prep_bf16(
         qv[j] = __bfloat162float(qrow[lane + 32 * j]);
         kv[j] = __bfloat162float(krow[lane + 32 * j]);
     }
-    l2_row(qv, qn);
-    l2_row(kv, kn);
+    l2_row(qv, qn, fla_numerics != 0);
+    l2_row(kv, kn, fla_numerics != 0);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         q3[out_row + lane + 32 * j] = __fmul_rn(qn[j], scale);

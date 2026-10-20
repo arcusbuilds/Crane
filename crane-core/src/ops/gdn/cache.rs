@@ -24,6 +24,8 @@ pub struct GdnLayerCache {
     /// Run the next forward's recurrence on the serial kernel even for
     /// `seq_len > 1` (short speculative-decoding blocks; see `fused_recurrence`).
     pub prefer_serial: bool,
+    /// Opt-in fused causal-conv/FLA input rounding for current Transformers.
+    pub fla_numerics: bool,
 }
 
 impl GdnLayerCache {
@@ -49,6 +51,7 @@ impl GdnLayerCache {
             checkpoint_at: None,
             checkpoint: None,
             prefer_serial: false,
+            fla_numerics: false,
         })
     }
 
@@ -95,6 +98,7 @@ impl Clone for GdnLayerCache {
             checkpoint_at: self.checkpoint_at,
             checkpoint: self.checkpoint.clone(),
             prefer_serial: self.prefer_serial,
+            fla_numerics: self.fla_numerics,
         }
     }
 }

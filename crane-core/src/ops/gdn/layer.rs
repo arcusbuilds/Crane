@@ -367,8 +367,19 @@ impl GatedDeltaNet {
             let (q, k, v) = split_qkv(&mixed_qkv, dims, batch_size, seq_len)?;
             let (q, k) = repeat_kv_heads(&q, &k, dims)?;
             // L2-normalize Q and K (Qwen 3.5 uses QK-norm = L2).
-            let q = l2_norm_fused(&q, &self.derived.l2_alpha, 1e-6)?;
-            let k = l2_norm_fused(&k, &self.derived.l2_alpha, 1e-6)?;
+            let (q, k) = if cache.fla_numerics {
+                (
+                    super::backend::l2_norm(&q.to_dtype(candle_core::DType::F32)?, 1e-6)?
+                        .to_dtype(dtype)?,
+                    super::backend::l2_norm(&k.to_dtype(candle_core::DType::F32)?, 1e-6)?
+                        .to_dtype(dtype)?,
+                )
+            } else {
+                (
+                    l2_norm_fused(&q, &self.derived.l2_alpha, 1e-6)?,
+                    l2_norm_fused(&k, &self.derived.l2_alpha, 1e-6)?,
+                )
+            };
             // β (write strength) and g (decay) from B, A, and the gate consts.
             let (beta, g) = compute_beta_g(&projected.b, &projected.a, &self.derived.gates, dtype)?;
             Ok((q, k, v, beta, g))
@@ -446,9 +457,48 @@ impl GatedDeltaNet {
         }
         let state = cache.conv_state.contiguous()?;
         let mut conv = timed(Span::GdnConv, || {
-            gf::conv_silu(&x2, &state, &fused.conv_w, split)
+            #[cfg(feature = "cuda")]
+            {
+                gf::conv_silu_with_numerics(&x2, &state, &fused.conv_w, split, cache.fla_numerics)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                gf::conv_silu(&x2, &state, &fused.conv_w, split)
+            }
         })?;
         cache.conv_state = conv.state.clone();
+
+        #[cfg(feature = "cuda")]
+        if cache.fla_numerics {
+            let segments = match split {
+                Some(p) => vec![(0, p), (p, seq_len - p)],
+                None => vec![(0, seq_len)],
+            };
+            let out_buf = gf::alloc_post_out(&x2, seq_len, h)?;
+            for (i, &(t0, len)) in segments.iter().enumerate() {
+                if i == 1 {
+                    let conv_state = conv.ckpt.take().expect("conv checkpoint for split prefill");
+                    cache.checkpoint = Some((conv_state, cache.recurrent_state.copy()?));
+                }
+                let mixed = conv.y.narrow(0, t0, len)?.reshape((1, len, dims.conv_dim))?;
+                let (q, k, v) = split_qkv(&mixed, dims, 1, len)?;
+                let (beta, g) = compute_beta_g(
+                    &projected.b.narrow(1, t0, len)?,
+                    &projected.a.narrow(1, t0, len)?,
+                    &self.derived.gates,
+                    act,
+                )?;
+                let (y, state) = super::chunked_fla::forward(
+                    &q, &k, &v, &g, &beta, &cache.recurrent_state,
+                )?;
+                cache.recurrent_state = state;
+                let y = y.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+                gf::post_norm(&out_buf, &y, &projected.z, &fused.norm_w, self.norm.eps(), t0, len, h)?;
+            }
+            let out = gf::post_out_tensor(out_buf, &x2, seq_len, h)?
+                .reshape((1, seq_len, dims.value_dim))?;
+            return timed(Span::GdnFinish, || self.out_proj.forward(&out));
+        }
 
         let segments: Vec<(usize, usize)> = match split {
             Some(p) => vec![(0, p), (p, seq_len - p)],
@@ -467,17 +517,35 @@ impl GatedDeltaNet {
                 cache.checkpoint = Some((conv_state, cache.recurrent_state.copy()?));
             }
             let pre = timed(Span::GdnQkv, || {
-                gf::prep(
-                    &conv.y,
-                    &projected.a,
-                    &projected.b,
-                    &self.derived.gates.neg_exp_a_log,
-                    &self.derived.gates.dt_bias,
-                    dims,
-                    t0,
-                    len,
-                    scale,
-                )
+                #[cfg(feature = "cuda")]
+                {
+                    gf::prep_with_numerics(
+                        &conv.y,
+                        &projected.a,
+                        &projected.b,
+                        &self.derived.gates.neg_exp_a_log,
+                        &self.derived.gates.dt_bias,
+                        dims,
+                        t0,
+                        len,
+                        scale,
+                        cache.fla_numerics,
+                    )
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    gf::prep(
+                        &conv.y,
+                        &projected.a,
+                        &projected.b,
+                        &self.derived.gates.neg_exp_a_log,
+                        &self.derived.gates.dt_bias,
+                        dims,
+                        t0,
+                        len,
+                        scale,
+                    )
+                }
             })?;
             let y = timed(Span::GdnRecur, || {
                 super::backend::recurrence_prepped(

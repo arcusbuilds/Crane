@@ -109,3 +109,84 @@ extern "C" __global__ void layer_norm_f32_welford(
         out[row*width+c]=__fmaf_rn(gamma[c],normalized,beta[c]);
     }
 }
+
+extern "C" __global__ void contiguous_add_f32(const float* a,const float* b,float* out,unsigned n) {
+    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)out[i]=__fadd_rn(a[i],b[i]);
+}
+extern "C" __global__ void adaptive_modulate_f32(const float* x,const float* m,float* out,
+                                                unsigned n,unsigned width,unsigned tokens,unsigned per_token,unsigned scale_first) {
+    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n)return;
+    unsigned row=per_token?i/width:i/(tokens*width),d=i%width,base=row*2*width;
+    float scale=__fadd_rn(m[base+(scale_first?0:width)+d],1.f);
+    out[i]=__fadd_rn(__fmul_rn(x[i],scale),m[base+(scale_first?width:0)+d]);
+}
+extern "C" __global__ void gated_kv_heads_f32(const float* k,const float* v,const float* gate,float* ko,float* vo,
+                                             unsigned n,unsigned tokens,unsigned heads,unsigned dim) {
+    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n)return;
+    unsigned d=i%dim,t=(i/dim)%tokens,h=(i/(dim*tokens))%heads,b=i/(dim*tokens*heads),width=heads*dim;
+    unsigned src=(b*tokens+t)*width+h*dim+d,g=b*2*width+h*dim+d;
+    ko[i]=__fmul_rn(k[src],gate[g]);vo[i]=__fmul_rn(v[src],gate[g+width]);
+}
+
+// F32 intermediates with BF16/F16 IO preserve the ordered normalization
+// graph while eliminating materialized cast tensors.
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+__device__ __forceinline__ float norm_float(__nv_bfloat16 x) {return __bfloat162float(x);}
+__device__ __forceinline__ float norm_float(__half x) {return __half2float(x);}
+template<typename T> __device__ __forceinline__ T norm_cast(float x);
+template<> __device__ __forceinline__ __nv_bfloat16 norm_cast<__nv_bfloat16>(float x) {return __float2bfloat16_rn(x);}
+template<> __device__ __forceinline__ __half norm_cast<__half>(float x) {return __float2half_rn(x);}
+template<typename T>
+__device__ __forceinline__ void rms_norm_low_impl(const T* x,const float* alpha,T* output,unsigned rows,unsigned width,float eps) {
+    unsigned lane=threadIdx.x%32,row=(blockIdx.x*blockDim.x+threadIdx.x)/32;
+    if(row>=rows)return;
+    float sums[4]={0.f,0.f,0.f,0.f};
+    for(unsigned col=lane*4;col<width;col+=128) {
+#pragma unroll
+        for(int j=0;j<4;++j) {
+            float v=norm_float(x[row*width+col+j]);
+            sums[j]=__fadd_rn(sums[j],__fmul_rn(v,v));
+        }
+    }
+    float sum=__fadd_rn(__fadd_rn(__fadd_rn(sums[0],sums[1]),sums[2]),sums[3]);
+    for(int off=16;off>0;off/=2)sum=__fadd_rn(sum,__shfl_down_sync(0xffffffff,sum,off));
+    sum=__shfl_sync(0xffffffff,sum,0);
+    float inv=rsqrtf(__fadd_rn(sum/width,eps));
+    for(unsigned col=lane;col<width;col+=32) {
+        float normalized=__fmul_rn(norm_float(x[row*width+col]),inv);
+        output[row*width+col]=norm_cast<T>(__fmul_rn(normalized,alpha[col]));
+    }
+}
+extern "C" __global__ void rms_norm_bf16_ordered(const __nv_bfloat16* x,const float* a,__nv_bfloat16* y,unsigned rows,unsigned width,float eps) {rms_norm_low_impl(x,a,y,rows,width,eps);}
+extern "C" __global__ void rms_norm_f16_ordered(const __half* x,const float* a,__half* y,unsigned rows,unsigned width,float eps) {rms_norm_low_impl(x,a,y,rows,width,eps);}
+extern "C" __global__ void transpose_heads_f32(const float* x,float* out,unsigned n,unsigned tokens,unsigned heads,unsigned dim,unsigned inverse) {
+    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n)return;
+    unsigned d=i%dim,h,t,b=i/(tokens*heads*dim);
+    if(inverse) {h=(i/dim)%heads;t=(i/(dim*heads))%tokens;out[i]=x[((b*heads+h)*tokens+t)*dim+d];}
+    else {t=(i/dim)%tokens;h=(i/(dim*tokens))%heads;out[i]=x[((b*tokens+t)*heads+h)*dim+d];}
+}
+
+template<typename T>
+__device__ __forceinline__ void swiglu_low_impl(const T* gate,const T* up,T* out,unsigned n) {
+    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) {
+        float g=norm_float(gate[i]);
+        T activated=norm_cast<T>(__fdiv_rn(g,__fadd_rn(1.f,expf(-g))));
+        out[i]=norm_cast<T>(__fmul_rn(norm_float(activated),norm_float(up[i])));
+    }
+}
+extern "C" __global__ void swiglu_bf16_ordered(const __nv_bfloat16* g,const __nv_bfloat16* u,__nv_bfloat16* y,unsigned n){swiglu_low_impl(g,u,y,n);}
+extern "C" __global__ void swiglu_f16_ordered(const __half* g,const __half* u,__half* y,unsigned n){swiglu_low_impl(g,u,y,n);}
+extern "C" __global__ void moe_selected_add_f32(const float* base,const float* value,const float* gate,const unsigned* selected,float* out,
+                                               unsigned n,unsigned width,unsigned experts,unsigned expert) {
+    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) {
+        unsigned row=i/width;
+        out[i]=selected[row]==expert?__fadd_rn(base[i],__fmul_rn(value[i],gate[row*experts+expert])):base[i];
+    }
+}

@@ -78,19 +78,8 @@ impl Qwen35RmsNorm {
 
 impl Module for Qwen35RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // candle's fused `rms_norm` normalizes in f32 internally regardless of
-        // the tensor dtype, so this keeps the previous f32 accumulation. It
-        // does require `alpha` to share `x`'s dtype and `x` to be contiguous;
-        // both hold already on every call site here, so both conversions are
-        // no-op clones rather than kernels.
         if matches!(x.dtype(), DType::BF16 | DType::F16) {
-            let alpha = self.alpha.to_dtype(DType::F32)?;
-            return crate::ops::float_math::rms_norm(
-                &x.to_dtype(DType::F32)?.contiguous()?,
-                Some(&alpha),
-                self.eps,
-            )?
-            .to_dtype(x.dtype());
+            return crate::ops::float_math::rms_norm_low_precision(x,&self.alpha.to_dtype(DType::F32)?,self.eps);
         }
         let alpha = self.alpha.to_dtype(x.dtype())?;
         candle_nn::ops::rms_norm(&x.contiguous()?, &alpha, self.eps)
@@ -684,7 +673,7 @@ impl FullAttention {
         let n_rep = self.num_heads / self.num_kv_heads;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
 
-        #[cfg(feature = "flash-attn")]
+        #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
         let flash_output = if self.flash_causal
             && q.device().is_cuda()
             && matches!(q.dtype(), DType::BF16 | DType::F16)
@@ -696,14 +685,14 @@ impl FullAttention {
                     let fv=v.transpose(1,2)?.contiguous()?;
                     if q.dtype()==DType::BF16 && self.head_dim==256 && fq.dim(1)?==fk.dim(1)? {
                         crate::ops::flash_split::causal_bf16_256_auto(&fq,&fk,&fv)
-                    } else {candle_flash_attn::flash_attn(&fq,&fk,&fv,scale as f32,true)}
+                    } else {crate::ops::flash_split::attention(&fq,&fk,&fv,scale as f32,true)}
                 }?
                 .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?,
             )
         } else {
             None
         };
-        #[cfg(not(feature = "flash-attn"))]
+        #[cfg(not(any(feature = "flash-attn", feature = "flash-inference")))]
         let flash_output: Option<Tensor> = None;
         let y = if let Some(output) = flash_output {
             output
@@ -929,9 +918,7 @@ impl Module for Mlp {
         let gate = self.gate.forward(x)?;
         let up = self.up.forward(x)?;
         let h = if matches!(gate.dtype(), DType::BF16 | DType::F16) {
-            candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?
-                .to_dtype(gate.dtype())?
-                .mul(&up)?
+            crate::ops::float_math::swiglu_low_precision(&gate,&up)?
         } else {
             crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?
         };
@@ -962,7 +949,7 @@ enum LayerImpl {
 impl DecoderLayer {
     /// Enable fused causal attention. Caller guarantees an unpadded standard
     /// causal mask; arbitrary masks must retain the default attention path.
-    #[cfg(feature = "flash-attn")]
+    #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
     pub fn enable_flash_causal(&mut self) {
         if let LayerImpl::FullAttention(attention) = &mut self.layer_impl {
             attention.flash_causal = true;

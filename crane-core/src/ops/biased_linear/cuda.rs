@@ -35,6 +35,16 @@ unsafe fn pref<T>(
     unsafe { lt::set_matmul_pref_attribute(desc, key, (value as *const T).cast(), size_of::<T>()) }
         .map_err(Error::wrap)
 }
+// Plans depend on shape, compute policy and actual pointer alignment, not
+// tensor values. Keep the original heuristic and workspace policy unchanged.
+type PlanKey = (usize, usize, usize, usize, bool, [u32; 4]);
+struct Plan {
+    desc: Resource<sys::cublasLtMatmulDesc_t>,
+    a: Resource<sys::cublasLtMatrixLayout_t>,
+    b: Resource<sys::cublasLtMatrixLayout_t>,
+    c: Resource<sys::cublasLtMatrixLayout_t>,
+    algo: sys::cublasLtMatmulAlgo_t,
+}
 pub(super) fn matmul<T: DeviceRepr>(
     blas: &CudaBlasLT,
     w: &CudaView<'_, T>,
@@ -48,7 +58,10 @@ pub(super) fn matmul<T: DeviceRepr>(
 ) -> Result<()> {
     use sys::cublasLtMatmulDescAttributes_t as A;
     use sys::cublasLtMatmulPreferenceAttributes_t as P;
-    thread_local! {static WORK:RefCell<HashMap<usize,CudaSlice<u8>>>=RefCell::new(HashMap::new());}
+    thread_local! {
+        static WORK:RefCell<HashMap<usize,CudaSlice<u8>>>=RefCell::new(HashMap::new());
+        static PLANS:RefCell<HashMap<PlanKey,Plan>>=RefCell::new(HashMap::new());
+    }
     let dtype = if tf32 {
         sys::cudaDataType_t::CUDA_R_32F
     } else {
@@ -75,78 +88,98 @@ pub(super) fn matmul<T: DeviceRepr>(
         let (bp, _bg) = bias.device_ptr(stream);
         let (op, _og) = out.device_ptr_mut(stream);
         let (scratch, _sg) = workspace.device_ptr_mut(stream);
-        let desc = own(
-            lt::create_matmul_desc(compute, sys::cudaDataType_t::CUDA_R_32F),
-            lt::destroy_matmul_desc,
-        )?;
-        let a = own(
-            lt::create_matrix_layout(dtype, k as u64, m as u64, k as i64),
-            lt::destroy_matrix_layout,
-        )?;
-        let b = own(
-            lt::create_matrix_layout(dtype, k as u64, n as u64, k as i64),
-            lt::destroy_matrix_layout,
-        )?;
-        let c = own(
-            lt::create_matrix_layout(dtype, m as u64, n as u64, m as i64),
-            lt::destroy_matrix_layout,
-        )?;
-        let preference = own(lt::create_matmul_pref(), lt::destroy_matmul_pref)?;
-        // SAFETY: all descriptors and device allocation guards stay live
-        // through the launch; the shared workspace is used on one stream.
-        unsafe {
-            attr(desc.0, A::CUBLASLT_MATMUL_DESC_TRANSA, &1i32)?;
-            attr(desc.0, A::CUBLASLT_MATMUL_DESC_TRANSB, &0i32)?;
-            attr(
-                desc.0,
-                A::CUBLASLT_MATMUL_DESC_EPILOGUE,
-                &sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
-            )?;
-            attr(desc.0, A::CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp)?;
-            pref(
-                preference.0,
-                P::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                &(1024 * 1024usize),
-            )?;
-            for (attribute, ptr) in [
-                (P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, wp),
-                (P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, xp),
-                (P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, op),
-                (P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, bp),
-            ] {
-                let alignment = (1u64 << ptr.trailing_zeros().min(8)) as u32;
-                pref(preference.0, attribute, &alignment)?;
+        let alignments = [wp, xp, op, bp].map(|ptr| (1u64 << ptr.trailing_zeros().min(8)) as u32);
+        let plan_key = (key, m, n, k, tf32, alignments);
+        PLANS.with(|plans| -> Result<()> {
+            let mut plans = plans.borrow_mut();
+            if let std::collections::hash_map::Entry::Vacant(entry) = plans.entry(plan_key) {
+                let desc = own(
+                    lt::create_matmul_desc(compute, sys::cudaDataType_t::CUDA_R_32F),
+                    lt::destroy_matmul_desc,
+                )?;
+                let a = own(
+                    lt::create_matrix_layout(dtype, k as u64, m as u64, k as i64),
+                    lt::destroy_matrix_layout,
+                )?;
+                let b = own(
+                    lt::create_matrix_layout(dtype, k as u64, n as u64, k as i64),
+                    lt::destroy_matrix_layout,
+                )?;
+                let c = own(
+                    lt::create_matrix_layout(dtype, m as u64, n as u64, m as i64),
+                    lt::destroy_matrix_layout,
+                )?;
+                let preference = own(lt::create_matmul_pref(), lt::destroy_matmul_pref)?;
+                // SAFETY: all descriptors and device allocation guards stay live
+                // through the launch; the shared workspace is used on one stream.
+                let algo = unsafe {
+                    attr(desc.0, A::CUBLASLT_MATMUL_DESC_TRANSA, &1i32)?;
+                    attr(desc.0, A::CUBLASLT_MATMUL_DESC_TRANSB, &0i32)?;
+                    attr(
+                        desc.0,
+                        A::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                        &sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
+                    )?;
+                    attr(desc.0, A::CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp)?;
+                    pref(
+                        preference.0,
+                        P::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                        &(1024 * 1024usize),
+                    )?;
+                    for (attribute, alignment) in [
+                        (P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, alignments[0]),
+                        (P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, alignments[1]),
+                        (P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, alignments[2]),
+                        (P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, alignments[3]),
+                    ] {
+                        pref(preference.0, attribute, &alignment)?;
+                    }
+                    let heuristic = lt::get_matmul_algo_heuristic(
+                        *blas.handle(),
+                        desc.0,
+                        a.0,
+                        b.0,
+                        c.0,
+                        c.0,
+                        preference.0,
+                    )
+                    .map_err(Error::wrap)?;
+                    heuristic.algo
+                };
+                entry.insert(Plan {
+                    desc,
+                    a,
+                    b,
+                    c,
+                    algo,
+                });
             }
-            let heuristic = lt::get_matmul_algo_heuristic(
-                *blas.handle(),
-                desc.0,
-                a.0,
-                b.0,
-                c.0,
-                c.0,
-                preference.0,
-            )
-            .map_err(Error::wrap)?;
-            lt::matmul(
-                *blas.handle(),
-                desc.0,
-                (&1f32 as *const f32).cast(),
-                (&0f32 as *const f32).cast(),
-                wp as *const _,
-                a.0,
-                xp as *const _,
-                b.0,
-                op as *const _,
-                c.0,
-                op as *mut _,
-                c.0,
-                &heuristic.algo,
-                scratch as *mut _,
-                1024 * 1024,
-                stream.cu_stream() as _,
-            )
-            .map_err(Error::wrap)?;
-        }
-        Ok(())
+            let plan = plans.get(&plan_key).expect("GEMM plan initialized");
+            // Bias addresses vary between layers sharing a plan. cuBLASLt consumes
+            // descriptors during this host call; all launches stay on one stream.
+            unsafe {
+                attr(plan.desc.0, A::CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp)?;
+                lt::matmul(
+                    *blas.handle(),
+                    plan.desc.0,
+                    (&1f32 as *const f32).cast(),
+                    (&0f32 as *const f32).cast(),
+                    wp as *const _,
+                    plan.a.0,
+                    xp as *const _,
+                    plan.b.0,
+                    op as *const _,
+                    plan.c.0,
+                    op as *mut _,
+                    plan.c.0,
+                    &plan.algo,
+                    scratch as *mut _,
+                    1024 * 1024,
+                    stream.cu_stream() as _,
+                )
+                .map_err(Error::wrap)?;
+            }
+            Ok(())
+        })
     })
 }

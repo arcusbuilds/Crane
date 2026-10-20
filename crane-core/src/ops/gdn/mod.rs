@@ -46,7 +46,9 @@ mod conv;
 #[cfg(feature = "cuda")]
 mod cuda_backend;
 #[cfg(feature = "cuda")]
-mod gdn_fused;
+pub mod gdn_fused;
+#[cfg(feature = "cuda")]
+pub mod chunked_fla;
 mod layer;
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 mod metal_backend;

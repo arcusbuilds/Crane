@@ -20,7 +20,7 @@ pub mod biased_linear;
 pub mod float_math;
 #[cfg(feature = "cudnn")]
 pub mod patch_conv3d;
-#[cfg(feature = "flash-attn")]
+#[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
 pub mod flash_split;
 pub mod fused_ops;
 pub mod gdn;
@@ -39,3 +39,6 @@ pub mod rocm;
 pub use fused_ops::*;
 pub use gdn::*;
 pub use linear::LinearLayer;
+
+#[cfg(feature = "cuda")]
+pub mod cuda_graph;

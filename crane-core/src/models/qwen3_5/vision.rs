@@ -57,9 +57,28 @@ impl PatchEmbed {
         let xs = xs.reshape(((), width))?.to_dtype(dtype)?;
         #[cfg(feature = "cudnn")]
         if xs.device().is_cuda() && dtype == DType::BF16 {
-            let patches=xs.reshape((xs.dim(0)?,self.in_channels,self.temporal_patch_size,self.patch_size,self.patch_size))?.to_dtype(DType::F32)?;
-            let weight=self.proj.reshape((self.hidden_size,self.in_channels,self.temporal_patch_size,self.patch_size,self.patch_size))?.to_dtype(DType::F32)?;
-            return crate::ops::patch_conv3d::full_patch_conv3d(&patches,&weight)?.to_dtype(dtype)?.broadcast_add(&self.bias.unsqueeze(0)?);
+            let patches = xs
+                .reshape((
+                    xs.dim(0)?,
+                    self.in_channels,
+                    self.temporal_patch_size,
+                    self.patch_size,
+                    self.patch_size,
+                ))?
+                .to_dtype(DType::F32)?;
+            let weight = self
+                .proj
+                .reshape((
+                    self.hidden_size,
+                    self.in_channels,
+                    self.temporal_patch_size,
+                    self.patch_size,
+                    self.patch_size,
+                ))?
+                .to_dtype(DType::F32)?;
+            return crate::ops::patch_conv3d::full_patch_conv3d(&patches, &weight)?
+                .to_dtype(dtype)?
+                .broadcast_add(&self.bias.unsqueeze(0)?);
         }
         let xs = xs.matmul(&self.proj.t()?)?;
         // ATen adds Conv3d bias after cuDNN rounds the convolution output.
@@ -173,17 +192,25 @@ impl VisionAttention {
                 let k = k_chunk.unsqueeze(0)?;
                 let v = v_chunk.unsqueeze(0)?;
                 let scale = 1. / (self.head_dim as f64).sqrt();
-                #[cfg(feature = "flash-attn")]
+                #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
                 let flash =
                     if xs.device().is_cuda() && matches!(xs.dtype(), DType::BF16 | DType::F16) {
                         Some(
                             {
-                                let fq=q.to_dtype(xs.dtype())?.transpose(1,2)?.contiguous()?;
-                                let fk=k.to_dtype(xs.dtype())?.transpose(1,2)?.contiguous()?;
-                                let fv=v.to_dtype(xs.dtype())?.transpose(1,2)?.contiguous()?;
-                                if xs.dtype()==DType::BF16 && self.head_dim==64 {
-                                    crate::ops::flash_split::noncausal_bf16_64(&fq,&fk,&fv)
-                                } else {candle_flash_attn::flash_attn(&fq,&fk,&fv,scale as f32,false)}
+                                let fq = q.to_dtype(xs.dtype())?.transpose(1, 2)?.contiguous()?;
+                                let fk = k.to_dtype(xs.dtype())?.transpose(1, 2)?.contiguous()?;
+                                let fv = v.to_dtype(xs.dtype())?.transpose(1, 2)?.contiguous()?;
+                                if xs.dtype() == DType::BF16 && self.head_dim == 64 {
+                                    crate::ops::flash_split::noncausal_bf16_64(&fq, &fk, &fv)
+                                } else {
+                                    crate::ops::flash_split::attention(
+                                        &fq,
+                                        &fk,
+                                        &fv,
+                                        scale as f32,
+                                        false,
+                                    )
+                                }
                             }?
                             .transpose(1, 2)?
                             .to_dtype(DType::F32)?,
@@ -191,7 +218,7 @@ impl VisionAttention {
                     } else {
                         None
                     };
-                #[cfg(not(feature = "flash-attn"))]
+                #[cfg(not(any(feature = "flash-attn", feature = "flash-inference")))]
                 let flash: Option<Tensor> = None;
                 match flash {
                     Some(output) => output,
@@ -253,7 +280,12 @@ impl VisionBlock {
         let normed = crate::ops::float_math::layer_norm::forward(&self.norm1, xs)?;
         let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin)?;
         let xs_att = xs.add(&attn_out)?;
-        let mlp_out = self.mlp.forward(&crate::ops::float_math::layer_norm::forward(&self.norm2, &xs_att)?)?;
+        let mlp_out = self
+            .mlp
+            .forward(&crate::ops::float_math::layer_norm::forward(
+                &self.norm2,
+                &xs_att,
+            )?)?;
         xs_att.add(&mlp_out)
     }
 }
@@ -340,12 +372,17 @@ impl VisionRotaryEmbedding {
         })
     }
 
-    fn make_embeds(&self, seqlen: usize) -> Result<Tensor> {
+    fn make_embeds(&self, seqlen: usize, promote: bool) -> Result<Tensor> {
         let seqlen_f32 = seqlen as f32;
+        let dtype = if promote {
+            DType::F32
+        } else {
+            self.inv_freq.dtype()
+        };
         let seq = Tensor::arange(0f32, seqlen_f32, self.inv_freq.device())?
-            .to_dtype(self.inv_freq.dtype())?
+            .to_dtype(dtype)?
             .unsqueeze(D::Minus1)?;
-        seq.broadcast_matmul(&self.inv_freq)
+        seq.broadcast_matmul(&self.inv_freq.to_dtype(dtype)?)
     }
 }
 
@@ -360,6 +397,7 @@ pub struct Qwen3_5VisionModel {
     spatial_merge_size: usize,
     num_grid_per_side: usize,
     hidden_size: usize,
+    modern_numerics: bool,
 }
 
 impl Qwen3_5VisionModel {
@@ -420,6 +458,7 @@ impl Qwen3_5VisionModel {
             spatial_merge_size: cfg.spatial_merge_size,
             num_grid_per_side,
             hidden_size: cfg.hidden_size,
+            modern_numerics: false,
         })
     }
 
@@ -428,6 +467,13 @@ impl Qwen3_5VisionModel {
             return vec![0.0];
         }
         let max_val = (self.num_grid_per_side - 1) as f32;
+        if self.modern_numerics {
+            // New Transformers computes index * (side - 1) / (size - 1),
+            // instead of endpoint-symmetric CUDA linspace.
+            return (0..steps)
+                .map(|i| (i as f32 * max_val) / (steps - 1) as f32)
+                .collect();
+        }
         let step = max_val / (steps.saturating_sub(1)) as f32;
         (0..steps)
             .map(|i| {
@@ -578,7 +624,9 @@ impl Qwen3_5VisionModel {
             .copied()
             .max()
             .unwrap_or(0) as usize;
-        let freq_table = self.rotary_pos_emb.make_embeds(max_hw)?;
+        let freq_table = self
+            .rotary_pos_emb
+            .make_embeds(max_hw, self.modern_numerics)?;
 
         let mut coords: Vec<(i64, i64)> = Vec::new();
         for g in &grid {
@@ -645,6 +693,12 @@ impl Qwen3_5VisionModel {
     /// Returns an error if the forward pass fails.
     pub fn forward(&self, xs: &Tensor, grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         self.forward_with_callback(xs, grid_thw, |_, _| Ok(()))
+    }
+
+    /// Opt in to the interpolation and FP32 vision RoPE arithmetic used by
+    /// Transformers 5.20. Legacy model consumers retain their numeric profile.
+    pub fn set_transformers_5_20_numerics(&mut self, enabled: bool) {
+        self.modern_numerics = enabled;
     }
 
     pub fn set_rotary_buffer_dtype(&mut self, dtype: DType) -> Result<()> {

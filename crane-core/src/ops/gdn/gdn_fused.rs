@@ -97,6 +97,17 @@ pub fn conv_silu(
     weight: &Tensor,
     ckpt_at: Option<usize>,
 ) -> Result<ConvOut> {
+    conv_silu_with_numerics(x, state, weight, ckpt_at, false)
+}
+
+/// CUDA extension precision: accumulate and activate in F32, then round once.
+pub fn conv_silu_with_numerics(
+    x: &Tensor,
+    state: &Tensor,
+    weight: &Tensor,
+    ckpt_at: Option<usize>,
+    fla_numerics: bool,
+) -> Result<ConvOut> {
     let (s, c) = x.dims2()?;
     let dev = x.device().as_cuda_device()?.clone();
     cuda_view!(x_v, x_g, x, bf16);
@@ -132,7 +143,18 @@ pub fn conv_silu(
     b.arg(&c_i);
     b.arg(&xs_i);
     b.arg(&p_i);
-    unsafe { b.launch(LaunchConfig::for_num_elems(c as u32)) }.w()?;
+    let modern = i32::from(fla_numerics);
+    b.arg(&modern);
+    let cfg = if fla_numerics {
+        LaunchConfig {
+            grid_dim: ((c as u32).div_ceil(256), s as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    } else {
+        LaunchConfig::for_num_elems(c as u32)
+    };
+    unsafe { b.launch(cfg) }.w()?;
 
     Ok(ConvOut {
         y: wrap(y, &dev, (s, c)),
@@ -176,6 +198,34 @@ pub fn prep(
     t0: usize,
     len: usize,
     scale: f32,
+) -> Result<Prepped> {
+    prep_with_numerics(
+        conv,
+        a,
+        b,
+        neg_exp_a_log,
+        dt_bias,
+        dims,
+        t0,
+        len,
+        scale,
+        false,
+    )
+}
+
+/// Prepare current FLA-style FP32-square/BF16-output Q/K normalization.
+#[allow(clippy::too_many_arguments)]
+pub fn prep_with_numerics(
+    conv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    neg_exp_a_log: &Tensor,
+    dt_bias: &Tensor,
+    dims: &GdnDims,
+    t0: usize,
+    len: usize,
+    scale: f32,
+    fla_numerics: bool,
 ) -> Result<Prepped> {
     let c = conv.dim(1)?;
     let h = dims.num_v_heads;
@@ -223,6 +273,8 @@ pub fn prep(
         bl.arg(i);
     }
     bl.arg(&scale);
+    let modern = i32::from(fla_numerics);
+    bl.arg(&modern);
     let cfg = LaunchConfig {
         grid_dim: (len as u32, h.div_ceil(WARPS) as u32, 1),
         block_dim: (32 * WARPS as u32, 1, 1),

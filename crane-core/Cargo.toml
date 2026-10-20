@@ -149,6 +149,8 @@ cuda = [
 ]
 cudnn = ["candle-core-default/cudnn"]
 flash-attn = ["cuda", "dep:candle-flash-attn", "dep:cudaforge"]
+# Header-only inference subset for BF16 vision-64 and causal-text-256.
+flash-inference = ["cuda", "dep:cudaforge"]
 # AMD ROCm/HIP backend (experimental fork). Also enables the fork's own
 # `rocm` feature — it's off by default there too. Build with
 # `--no-default-features`: this crate's `default` feature pulls in the
