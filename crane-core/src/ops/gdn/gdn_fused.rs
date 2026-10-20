@@ -27,12 +27,17 @@ const CONV_K: usize = 4;
 const WARPS: usize = 4;
 
 /// Whether the fused path can run for this layer and input: CUDA, bf16, batch 1,
-/// more than one token, 128-wide heads and a 4-tap conv.
+/// 128-wide heads and a 4-tap conv. Single-token decode remains opt-in.
 pub fn supported(x: &Tensor, dims: &GdnDims) -> bool {
     x.device().is_cuda()
         && x.dtype() == DType::BF16
         && x.dim(0).is_ok_and(|b| b == 1)
-        && x.dim(1).is_ok_and(|s| s > 1)
+        && x.dim(1).is_ok_and(|s| {
+            s > 1
+                || (s == 1
+                    && std::env::var("CRANE_GDN_FUSED").is_ok_and(|v| v == "1")
+                    && std::env::var("CRANE_GDN_PORTABLE").is_err())
+        })
         && dims.head_k_dim == HEAD_DIM
         && dims.head_v_dim == HEAD_DIM
         && dims.conv_kernel_size == CONV_K
@@ -160,6 +165,52 @@ pub fn conv_silu_with_numerics(
         y: wrap(y, &dev, (s, c)),
         state: wrap(new_state, &dev, (1, c, CONV_K)),
         ckpt: ckpt_buf.map(|buf| wrap(buf, &dev, (1, c, CONV_K))),
+    })
+}
+
+/// Single-token convolution rounding through BF16 before FP32 SiLU.
+///
+/// # Errors
+///
+/// Rejects invalid shapes, layouts, dtypes or devices before launching CUDA.
+pub(super) fn decode_conv_silu(x: &Tensor, state: &Tensor, weight: &Tensor) -> Result<ConvOut> {
+    let (s, c) = x.dims2()?;
+    if s != 1 || c == 0 || c > i32::MAX as usize / CONV_K {
+        candle_core::bail!("gdn decode conv: expected a nonempty [1, C] input");
+    }
+    if state.dims() != [1, c, CONV_K] || weight.dims() != [c, CONV_K] {
+        candle_core::bail!("gdn decode conv: expected state [1, C, 4] and weight [C, 4]");
+    }
+    if !x.is_contiguous() || !state.is_contiguous() || !weight.is_contiguous() {
+        candle_core::bail!("gdn decode conv: inputs must be contiguous");
+    }
+    if !x.device().same_device(state.device()) || !x.device().same_device(weight.device()) {
+        candle_core::bail!("gdn decode conv: inputs must be on the same CUDA device");
+    }
+    let dev = x.device().as_cuda_device()?.clone();
+    cuda_view!(x_v, x_g, x, bf16);
+    cuda_view!(state_v, state_g, state, bf16);
+    cuda_view!(w_v, w_g, weight, f32);
+    let y = unsafe { dev.alloc::<bf16>(c) }?;
+    let new_state = unsafe { dev.alloc::<bf16>(c * CONV_K) }?;
+    let func = dev.get_or_load_custom_func(
+        "gdn_decode_conv_silu_bf16",
+        "crane_gdn_decode_conv",
+        ptx::GDN_DECODE_CONV,
+    )?;
+    let c_i = c as i32;
+    let mut launch = func.builder();
+    launch.arg(&x_v);
+    launch.arg(&state_v);
+    launch.arg(&w_v);
+    launch.arg(&y);
+    launch.arg(&new_state);
+    launch.arg(&c_i);
+    unsafe { launch.launch(LaunchConfig::for_num_elems(c as u32)) }.w()?;
+    Ok(ConvOut {
+        y: wrap(y, &dev, (1, c)),
+        state: wrap(new_state, &dev, (1, c, CONV_K)),
+        ckpt: None,
     })
 }
 
@@ -360,4 +411,87 @@ pub fn post_out_tensor(
 ) -> Result<Tensor> {
     let dev = like.device().as_cuda_device()?.clone();
     Ok(wrap(buf, &dev, (seq_len, h * HEAD_DIM)))
+}
+
+#[cfg(test)]
+mod decode_conv_tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn values(t: &Tensor) -> Result<Vec<bf16>> {
+        t.flatten_all()?.to_vec1::<bf16>()
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA GPU"]
+    fn decode_conv_matches_reference_and_preserves_history() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        // Pin both the BF16 halfway tie and the cancellation-sensitive sum tree.
+        for (history, input, expected) in [
+            ([0f32, 1., 1. / 256., 0.], 0f32, 0.73046875),
+            ([0f32, 16777216., 1., -16777216.], 1f32, 1.7578125),
+        ] {
+            let x = Tensor::new(&[[input]], &dev)?.to_dtype(DType::BF16)?;
+            let state = Tensor::new(&[[history]], &dev)?.to_dtype(DType::BF16)?;
+            let weight = Tensor::ones((1, 4), DType::F32, &dev)?;
+            let out = decode_conv_silu(&x, &state, &weight)?;
+            assert_eq!(values(&out.y)?, vec![bf16::from_f32(expected)]);
+        }
+        for c in [1, 7, 6144] {
+            // Nonzero storage offsets must be respected by all three inputs.
+            let mut state = Tensor::arange(0f32, (c * CONV_K + 4) as f32, &dev)?
+                .affine(0.003, -1.)?
+                .to_dtype(DType::BF16)?
+                .narrow(0, 4, c * CONV_K)?
+                .reshape((1, c, CONV_K))?;
+            let weight = Tensor::arange(0f32, (c * CONV_K + 4) as f32, &dev)?
+                .affine(0.0001, -0.5)?
+                .to_dtype(DType::BF16)?
+                .to_dtype(DType::F32)?
+                .narrow(0, 4, c * CONV_K)?
+                .reshape((c, CONV_K))?;
+            for step in 0..8 {
+                let x = Tensor::arange(0f32, (c + 1) as f32, &dev)?
+                    .affine(0.002, step as f64 * 0.01)?
+                    .to_dtype(DType::BF16)?
+                    .narrow(0, 1, c)?
+                    .reshape((1, c))?;
+                let original = values(&state)?;
+                let window = Tensor::cat(&[&state.narrow(2, 1, 3)?, &x.reshape((1, c, 1))?], 2)?;
+                let sum = window
+                    .to_dtype(DType::F32)?
+                    .broadcast_mul(&weight.unsqueeze(0)?)?
+                    .sum_keepdim(2)?
+                    .to_dtype(DType::BF16)?
+                    .to_dtype(DType::F32)?;
+                let expected = candle_nn::ops::silu(&sum)?
+                    .to_dtype(DType::BF16)?
+                    .reshape((1, c))?;
+                let out = decode_conv_silu(&x, &state, &weight)?;
+                assert_eq!(out.y.dims(), &[1, c]);
+                assert_eq!(values(&out.y)?, values(&expected)?, "C={c}, step={step}");
+                assert_eq!(values(&out.state)?, values(&window)?);
+                assert_eq!(values(&state)?, original, "input state was modified");
+                assert!(out.ckpt.is_none());
+                state = out.state;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA GPU"]
+    fn decode_conv_rejects_invalid_buffers() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let x = Tensor::zeros((1, 7), DType::BF16, &dev)?;
+        let state = Tensor::zeros((1, 7, 4), DType::BF16, &dev)?;
+        let weight = Tensor::ones((7, 4), DType::F32, &dev)?;
+        assert!(decode_conv_silu(&x, &state.narrow(2, 0, 3)?, &weight).is_err());
+        assert!(decode_conv_silu(&x, &state, &weight.transpose(0, 1)?).is_err());
+        assert!(decode_conv_silu(&x.to_dtype(DType::F32)?, &state, &weight).is_err());
+        assert!(decode_conv_silu(&x, &state, &weight.to_device(&Device::Cpu)?).is_err());
+        assert!(decode_conv_silu(&x.narrow(1, 0, 0)?, &state, &weight).is_err());
+        assert!(decode_conv_silu(&x.broadcast_as((2, 7))?, &state, &weight).is_err());
+        Ok(())
+    }
 }

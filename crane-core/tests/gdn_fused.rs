@@ -130,7 +130,14 @@ fn run_with(
     } else {
         unsafe { std::env::set_var("CRANE_GDN_PORTABLE", "1") };
     }
+    // Each side needs independent storage: recurrence backends may mutate state.
     let mut c = cache.clone();
+    c.conv_state = cache.conv_state.copy().unwrap();
+    c.recurrent_state = cache.recurrent_state.copy().unwrap();
+    c.checkpoint = cache
+        .checkpoint
+        .as_ref()
+        .map(|(conv, rec)| (conv.copy().unwrap(), rec.copy().unwrap()));
     c.checkpoint_at = split;
     c.prefer_serial = serial;
     let y = gdn.forward(x, dims, &mut c).unwrap();
@@ -344,4 +351,63 @@ fn prefill_serial_vs_chunked() {
         );
     }
     unsafe { std::env::remove_var("CRANE_GDN_CHUNKED") };
+}
+
+/// Decode must preserve state over time, not just on one isolated pass.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn decode_stages_match_across_steps_and_checkpoints() {
+    use crane_core::ops::gdn::VHeadOrder;
+    let (dev, _) = gpu();
+    for v_heads in [4, 8] {
+        let cfg = Cfg {
+            hidden: 512,
+            k_heads: 4,
+            v_heads,
+        };
+        let (gdn, mut dims) = layer(&dev, &cfg, DType::BF16);
+        for (order, fla) in [
+            (VHeadOrder::Interleaved, false),
+            (VHeadOrder::Chunked, false),
+            (VHeadOrder::Interleaved, true),
+        ] {
+            dims.v_head_order = order;
+            let mut base = GdnLayerCache::new(&cfg, DType::BF16, &dev).unwrap();
+            base.fla_numerics = fla;
+            let prefix = rand(&dev, &[1, 11, cfg.hidden], 1.)
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let (_, mut reference) = run(&gdn, &dims, &prefix, &base, None, false);
+            // Simulate a cache loaded in F32 before the first BF16 decode.
+            reference.conv_state = reference.conv_state.to_dtype(DType::F32).unwrap();
+            let mut fused = reference.clone();
+            for step in 0..8 {
+                let x = rand(&dev, &[1, 1, cfg.hidden], 1.)
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let checkpoint = match step {
+                    0 => Some(0),
+                    1 => Some(1),
+                    _ => None,
+                };
+                let (ya, ca) = run(&gdn, &dims, &x, &reference, checkpoint, false);
+                let (yb, cb) = run(&gdn, &dims, &x, &fused, checkpoint, true);
+                let (_, _, ymax) = diff(&ya, &yb);
+                let (cd, _, _) = diff(&ca.conv_state, &cb.conv_state);
+                let (_, _, rmax) = diff(&ca.recurrent_state, &cb.recurrent_state);
+                assert_eq!(cd, 0, "conv step {step}, {order:?}");
+                assert_eq!(rmax, 0., "state step {step}, {order:?}, fla={fla}");
+                assert_eq!(ymax, 0., "output step {step}, {order:?}, fla={fla}");
+                assert_eq!(ca.checkpoint.is_some(), cb.checkpoint.is_some());
+                if let (Some((ac, ar)), Some((bc, br))) = (&ca.checkpoint, &cb.checkpoint) {
+                    assert_eq!(diff(ac, bc).0, 0);
+                    assert!(diff(ar, br).2 < 1e-3);
+                }
+                reference = ca;
+                fused = cb;
+            }
+        }
+    }
+    unsafe { std::env::remove_var("CRANE_GDN_FUSED") };
 }

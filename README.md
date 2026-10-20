@@ -773,6 +773,11 @@ gates and layout, gated norm), which replace ~45 small launches per layer
 bit-for-bit (`CRANE_GDN_FUSED=0` selects the op-by-op path). They also speed up
 bf16 prefill chunks.
 
+For CUDA single-token decode, `CRANE_GDN_FUSED=1` also enables the fused
+four-tap convolution for batch-one BF16 inputs; 128-wide heads additionally
+reuse fused Q/K/V preparation and gated normalization. This decode path is
+opt-in and leaves the FLA numerical mode on its existing path.
+
 Tests: `cargo test -p crane-core --features cuda --test gdn_fused --test topk_rows -- --ignored`
 (fused vs op chain, bit-exact), `--test dspark_drafter_parity` (vs PyTorch), and
 `--test minicpm_v47_dspark` (speculative == plain greedy).
