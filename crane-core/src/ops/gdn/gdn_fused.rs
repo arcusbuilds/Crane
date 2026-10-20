@@ -36,6 +36,7 @@ pub fn supported(x: &Tensor, dims: &GdnDims) -> bool {
         && dims.head_k_dim == HEAD_DIM
         && dims.head_v_dim == HEAD_DIM
         && dims.conv_kernel_size == CONV_K
+        && std::env::var("CRANE_GDN_PORTABLE").is_err()
         && std::env::var("CRANE_GDN_FUSED").map_or(true, |v| v != "0")
 }
 

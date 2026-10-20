@@ -131,10 +131,109 @@ fn run_with(
         unsafe { std::env::set_var("CRANE_GDN_PORTABLE", "1") };
     }
     let mut c = cache.clone();
+    // These tests retain coverage of the legacy fused/portable implementations.
+    c.fla_numerics = false;
     c.checkpoint_at = split;
     c.prefer_serial = serial;
     let y = gdn.forward(x, dims, &mut c).unwrap();
     (y, c)
+}
+
+/// The production default must preserve nonzero state, speculative rollback
+/// and decode when switching from chunk FLA to the single-token recurrence.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a CUDA GPU; run with --test-threads=1"]
+fn cuda_default_fla_state_and_decode() {
+    for name in [
+        "CRANE_GDN_FLA",
+        "CRANE_GDN_FUSED",
+        "CRANE_GDN_PORTABLE",
+        "CRANE_GDN_SERIAL_PREFILL",
+        "CRANE_GDN_SERIAL_MAX",
+    ] {
+        unsafe { std::env::remove_var(name) };
+    }
+    let (dev, _) = gpu();
+    for (v_heads, order) in [
+        (4, crane_core::ops::gdn::VHeadOrder::Interleaved),
+        (8, crane_core::ops::gdn::VHeadOrder::Interleaved),
+        (8, crane_core::ops::gdn::VHeadOrder::Chunked),
+    ] {
+        let cfg = Cfg {
+            hidden: 512,
+            k_heads: 4,
+            v_heads,
+        };
+        let (gdn, mut dims) = layer(&dev, &cfg, DType::BF16);
+        dims.v_head_order = order;
+        let mut base = GdnLayerCache::new(&cfg, DType::BF16, &dev).unwrap();
+        assert!(base.fla_numerics);
+        assert!(
+            !GdnLayerCache::new(&cfg, DType::F32, &dev)
+                .unwrap()
+                .fla_numerics
+        );
+        let prefix = rand(&dev, &[1, 17, cfg.hidden], 1.0)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        gdn.forward(&prefix, &dims, &mut base).unwrap();
+        let x = rand(&dev, &[1, 130, cfg.hidden], 1.0)
+            .to_dtype(DType::BF16)
+            .unwrap();
+        // Deep copies: the optimized recurrence may update storage in place.
+        let copy = |cache: &GdnLayerCache| {
+            let mut c = cache.clone();
+            c.conv_state = cache.conv_state.copy().unwrap();
+            c.recurrent_state = cache.recurrent_state.copy().unwrap();
+            c.checkpoint_at = Some(65);
+            c
+        };
+        let mut actual = copy(&base);
+        let mut reference = copy(&base);
+        let y = gdn.forward(&x, &dims, &mut actual).unwrap();
+        unsafe { std::env::set_var("CRANE_GDN_PORTABLE", "1") };
+        let expected = gdn.forward(&x, &dims, &mut reference).unwrap();
+        unsafe { std::env::remove_var("CRANE_GDN_PORTABLE") };
+        let (_, _, ymax) = diff(&y, &expected);
+        let (_, _, rmax) = diff(&actual.recurrent_state, &reference.recurrent_state);
+        println!("default FLA HV={v_heads} {order:?}: output max={ymax:.3e}, state max={rmax:.3e}");
+        assert_eq!(diff(&actual.conv_state, &reference.conv_state).0, 0);
+        // Different BF16 accumulation graphs; also tested against Torch FLA
+        // by Soma's shared-tensor parity fixture and real backbone regression.
+        assert!(ymax < 0.05 && rmax < 0.01);
+        let (conv, state) = actual.checkpoint.as_ref().unwrap();
+        let saved_conv = conv.copy().unwrap();
+        let saved_state = state.copy().unwrap();
+        actual.take_checkpoint();
+        assert_eq!(diff(&actual.conv_state, &saved_conv).0, 0);
+        assert_eq!(diff(&actual.recurrent_state, &saved_state).0, 0);
+        // Compare decode algorithms from identical restored state, rather than
+        // carrying the different prefill accumulation graphs into this check.
+        reference = actual.clone();
+        reference.conv_state = actual.conv_state.copy().unwrap();
+        reference.recurrent_state = actual.recurrent_state.copy().unwrap();
+        let token = x.narrow(1, 65, 1).unwrap();
+        let decoded = gdn.forward(&token, &dims, &mut actual).unwrap();
+        unsafe { std::env::set_var("CRANE_GDN_PORTABLE", "1") };
+        let expected = gdn.forward(&token, &dims, &mut reference).unwrap();
+        unsafe { std::env::remove_var("CRANE_GDN_PORTABLE") };
+        assert!(diff(&decoded, &expected).2 < 0.05);
+        assert_eq!(diff(&actual.conv_state, &reference.conv_state).0, 0);
+        assert!(diff(&actual.recurrent_state, &reference.recurrent_state).2 < 1e-5);
+    }
+    unsafe { std::env::set_var("CRANE_GDN_FLA", "0") };
+    let cfg = Cfg {
+        hidden: 512,
+        k_heads: 4,
+        v_heads: 4,
+    };
+    assert!(
+        !GdnLayerCache::new(&cfg, DType::BF16, &dev)
+            .unwrap()
+            .fla_numerics
+    );
+    unsafe { std::env::remove_var("CRANE_GDN_FLA") };
 }
 
 fn diff(a: &Tensor, b: &Tensor) -> (usize, usize, f32) {

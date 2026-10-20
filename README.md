@@ -769,12 +769,16 @@ at about plain speed (short answers pay a few losing rounds before it switches).
 
 Verification is fast because multi-token passes through the GDN layers run on
 three fused CUDA kernels (`kernels/cuda/gdn_fused.cu`: conv+silu, Q/K/V prep with
-gates and layout, gated norm), which replace ~45 small launches per layer
-bit-for-bit (`CRANE_GDN_FUSED=0` selects the op-by-op path). They also speed up
-bf16 prefill chunks.
+gates and layout, gated norm), which replace ~45 small launches per layer.
+Supported CUDA BF16 prefill now defaults to the native FLA chunk recurrence
+and Transformers-compatible rounding, shared with Soma/XFuse05. Decode and
+explicit serial verification retain the recurrent kernel. `CRANE_GDN_FLA=0`
+restores the legacy arithmetic; `CRANE_GDN_FUSED=0` selects op-by-op preprocessing,
+and `CRANE_GDN_PORTABLE=1` also forces portable recurrence.
 
 Tests: `cargo test -p crane-core --features cuda --test gdn_fused --test topk_rows -- --ignored`
-(fused vs op chain, bit-exact), `--test dspark_drafter_parity` (vs PyTorch), and
+(legacy fused vs op chain, plus default FLA state/rollback/decode; use
+`--test-threads=1` for environment-switching tests), `--test dspark_drafter_parity` (vs PyTorch), and
 `--test minicpm_v47_dspark` (speculative == plain greedy).
 
 **Metal (Apple Silicon).** Everything above also runs on Metal (`--features metal`;
@@ -987,7 +991,8 @@ above for context):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CRANE_GDN_PORTABLE` | unset | Force the portable op-by-op GDN recurrence path on CUDA/ROCm (skip the fused kernel) |
+| `CRANE_GDN_FLA` | enabled for CUDA BF16 | Native FLA chunk prefill and current Transformers rounding (the XFuse05/Soma path); `0` restores legacy arithmetic. Unsupported fused shapes/dtypes/devices keep existing implementations |
+| `CRANE_GDN_PORTABLE` | unset | Force the portable op-by-op GDN path on CUDA/ROCm (skip fused preprocessing and recurrence) |
 | `CRANE_KV_QUANT` | unset | K/V cache representation: `int8` (≈2× smaller) or `int4` (≈4× smaller); unset = fp |
 | `CRANE_FULL_RECOMPUTE` | unset | Force the O(n²) reset-and-reprocess decode path (debugging cross-check) |
 | `CRANE_GDN_VTILE` | unset | V-column tile size for the fused CUDA/ROCm GDN kernel (advanced tuning) |
