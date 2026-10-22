@@ -316,6 +316,27 @@ impl GatedDeltaNet {
         // 2. Causal Conv1D over [Q|K|V].
         let (mixed_qkv, conv_ckpt) = timed(Span::GdnConv, || {
             let mixed_qkv = projected.conv_input(dims, batch_size, seq_len)?;
+            #[cfg(feature = "cuda")]
+            if batch_size == 1
+                && seq_len == 1
+                && dims.conv_kernel_size == 4
+                && !cache.fla_numerics
+                && mixed_qkv.device().is_cuda()
+                && mixed_qkv.dtype() == DType::BF16
+                && mixed_qkv.is_contiguous()
+                // Keep the decode optimization opt-in while benchmarking.
+                && std::env::var("CRANE_GDN_FUSED").is_ok_and(|v| v == "1")
+                && let Some(fused) = &self.derived.fused
+            {
+                let state = cache.conv_state.to_dtype(DType::BF16)?.contiguous()?;
+                let out = gf::decode_conv_silu(
+                    &mixed_qkv.reshape((1, dims.conv_dim))?,
+                    &state,
+                    &fused.conv_w,
+                )?;
+                cache.conv_state = out.state;
+                return Ok((out.y.reshape((1, 1, dims.conv_dim))?, None));
+            }
             causal_conv1d_ckpt(&mixed_qkv, &self.conv1d_weight, dims, cache, split)
         })?;
 
@@ -433,7 +454,7 @@ impl GatedDeltaNet {
         })
     }
 
-    /// The fused path (a multi-token bf16 pass on CUDA, any pass on Metal);
+    /// The fused BF16 path on CUDA (decode opt-in), any pass on Metal;
     /// `split` is the speculative-decoding checkpoint position
     /// (`0 < p < seq_len`).
     #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -459,6 +480,10 @@ impl GatedDeltaNet {
         let mut conv = timed(Span::GdnConv, || {
             #[cfg(feature = "cuda")]
             {
+                if seq_len == 1 {
+                    // Preserve main's S=1 BF16 rounding; FLA prefill uses its own profile.
+                    return gf::decode_conv_silu(&x2, &state, &fused.conv_w);
+                }
                 gf::conv_silu_with_numerics(&x2, &state, &fused.conv_w, split, cache.fla_numerics)
             }
             #[cfg(not(feature = "cuda"))]

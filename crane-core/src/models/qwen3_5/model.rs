@@ -1314,3 +1314,7 @@ mod tests {
         assert_eq!(eos_token_ids, vec![7]);
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "fla_decode_tests.rs"]
+mod fla_decode_tests;

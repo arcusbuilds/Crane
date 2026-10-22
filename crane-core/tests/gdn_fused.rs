@@ -130,9 +130,16 @@ fn run_with(
     } else {
         unsafe { std::env::set_var("CRANE_GDN_PORTABLE", "1") };
     }
+    // Each side needs independent storage: recurrence backends may mutate state.
     let mut c = cache.clone();
     // These tests retain coverage of the legacy fused/portable implementations.
     c.fla_numerics = false;
+    c.conv_state = cache.conv_state.copy().unwrap();
+    c.recurrent_state = cache.recurrent_state.copy().unwrap();
+    c.checkpoint = cache
+        .checkpoint
+        .as_ref()
+        .map(|(conv, rec)| (conv.copy().unwrap(), rec.copy().unwrap()));
     c.checkpoint_at = split;
     c.prefer_serial = serial;
     let y = gdn.forward(x, dims, &mut c).unwrap();
@@ -251,6 +258,11 @@ fn diff(a: &Tensor, b: &Tensor) -> (usize, usize, f32) {
         .unwrap()
         .to_vec1::<f32>()
         .unwrap();
+    assert_eq!(a.len(), b.len());
+    assert!(
+        a.iter().chain(&b).all(|v| v.is_finite()),
+        "nonfinite tensor"
+    );
     let mismatched = a.iter().zip(&b).filter(|(x, y)| x != y).count();
     let max = a
         .iter()
@@ -443,4 +455,232 @@ fn prefill_serial_vs_chunked() {
         );
     }
     unsafe { std::env::remove_var("CRANE_GDN_CHUNKED") };
+}
+
+/// Decode must preserve state over time, not just on one isolated pass.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn decode_stages_match_across_steps_and_checkpoints() {
+    let _env = FlaTestEnv::new();
+    use crane_core::ops::gdn::VHeadOrder;
+    let (dev, _) = gpu();
+    for v_heads in [4, 8] {
+        let cfg = Cfg {
+            hidden: 512,
+            k_heads: 4,
+            v_heads,
+        };
+        let (gdn, mut dims) = layer(&dev, &cfg, DType::BF16);
+        for order in [VHeadOrder::Interleaved, VHeadOrder::Chunked] {
+            dims.v_head_order = order;
+            let base = GdnLayerCache::new(&cfg, DType::BF16, &dev).unwrap();
+            let prefix = rand(&dev, &[1, 11, cfg.hidden], 1.)
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let (_, mut reference) = run(&gdn, &dims, &prefix, &base, None, false);
+            // Simulate a cache loaded in F32 before the first BF16 decode.
+            reference.conv_state = reference.conv_state.to_dtype(DType::F32).unwrap();
+            let mut fused = reference.clone();
+            for step in 0..8 {
+                let x = rand(&dev, &[1, 1, cfg.hidden], 1.)
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let checkpoint = match step {
+                    0 => Some(0),
+                    1 => Some(1),
+                    _ => None,
+                };
+                let (ya, ca) = run(&gdn, &dims, &x, &reference, checkpoint, false);
+                let (yb, cb) = run(&gdn, &dims, &x, &fused, checkpoint, true);
+                let (_, _, ymax) = diff(&ya, &yb);
+                let (cd, _, _) = diff(&ca.conv_state, &cb.conv_state);
+                let (_, _, rmax) = diff(&ca.recurrent_state, &cb.recurrent_state);
+                assert_eq!(cd, 0, "conv step {step}, {order:?}");
+                assert_eq!(rmax, 0., "state step {step}, {order:?}");
+                assert_eq!(ymax, 0., "output step {step}, {order:?}");
+                assert_eq!(ca.checkpoint.is_some(), cb.checkpoint.is_some());
+                if let (Some((ac, ar)), Some((bc, br))) = (&ca.checkpoint, &cb.checkpoint) {
+                    assert_eq!(diff(ac, bc).0, 0);
+                    assert!(diff(ar, br).2 < 1e-3);
+                }
+                reference = ca;
+                fused = cb;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn fla_prefill_then_fused_decode_matches_reference() -> Result<()> {
+    use crane_core::ops::gdn::VHeadOrder;
+    let _env = FlaTestEnv::new();
+    let (dev, _) = gpu();
+    dev.set_seed(194)?;
+    let mut mismatch = 0;
+    for (v_heads, order) in [
+        (4, VHeadOrder::Interleaved),
+        (8, VHeadOrder::Interleaved),
+        (8, VHeadOrder::Chunked),
+    ] {
+        let cfg = Cfg {
+            hidden: 512,
+            k_heads: 4,
+            v_heads,
+        };
+        let (gdn, mut dims) = layer(&dev, &cfg, DType::BF16);
+        dims.v_head_order = order;
+        let inputs = rand(&dev, &[1, 386, cfg.hidden], 1.).to_dtype(DType::BF16)?;
+        for prefix_len in [1, 63, 64, 65, 130] {
+            let mut reference = GdnLayerCache::new(&cfg, DType::BF16, &dev)?;
+            assert!(reference.fla_numerics);
+            unsafe {
+                std::env::set_var("CRANE_GDN_FUSED", if prefix_len == 1 { "0" } else { "1" });
+            }
+            let prefix = inputs.narrow(1, 0, prefix_len)?;
+            let mut actual = GdnLayerCache::new(&cfg, DType::BF16, &dev)?;
+            let expected = gdn.forward(&prefix, &dims, &mut reference)?;
+            let y = gdn.forward(&prefix, &dims, &mut actual)?;
+            for (a, b) in [
+                (&y, &expected),
+                (&actual.conv_state, &reference.conv_state),
+                (&actual.recurrent_state, &reference.recurrent_state),
+            ] {
+                assert_eq!(diff(a, b).0, 0, "common prefix must be identical");
+            }
+            for step in 0..256 {
+                let x = inputs.narrow(1, prefix_len + step, 1)?;
+                unsafe {
+                    std::env::set_var("CRANE_GDN_FUSED", "0");
+                }
+                let expected = gdn.forward(&x, &dims, &mut reference)?;
+                unsafe {
+                    std::env::set_var("CRANE_GDN_FUSED", "1");
+                }
+                let y = gdn.forward(&x, &dims, &mut actual)?;
+                for (name, a, b) in [
+                    ("output", &y, &expected),
+                    ("conv", &actual.conv_state, &reference.conv_state),
+                    ("state", &actual.recurrent_state, &reference.recurrent_state),
+                ] {
+                    let (n, _, max) = diff(a, b);
+                    mismatch += n;
+                    if n > 0 && (mismatch < 1000 || [0, 1, 63, 127, 255].contains(&step)) {
+                        println!(
+                            "FLA decode prefix={prefix_len} HV={v_heads} order={order:?} step={step} {name}: unequal={n}, max={max:.9e}"
+                        );
+                    }
+                }
+                if step == 63 {
+                    actual.save_checkpoint()?;
+                    let saved_conv = actual.conv_state.copy()?;
+                    let saved_state = actual.recurrent_state.copy()?;
+                    let next = inputs.narrow(1, prefix_len + step + 1, 1)?;
+                    let first = gdn.forward(&next, &dims, &mut actual)?;
+                    actual.take_checkpoint();
+                    assert_eq!(diff(&actual.conv_state, &saved_conv).0, 0);
+                    assert_eq!(diff(&actual.recurrent_state, &saved_state).0, 0);
+                    actual.save_checkpoint()?;
+                    let replay = gdn.forward(&next, &dims, &mut actual)?;
+                    assert_eq!(diff(&first, &replay).0, 0, "checkpoint replay");
+                    actual.take_checkpoint();
+                }
+            }
+        }
+    }
+    assert_eq!(
+        mismatch, 0,
+        "added decode error exceeds initial zero-error gate"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+struct FlaTestEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+#[cfg(feature = "cuda")]
+impl FlaTestEnv {
+    fn new() -> Self {
+        let keys = [
+            "CRANE_GDN_FLA",
+            "CRANE_GDN_FUSED",
+            "CRANE_GDN_PORTABLE",
+            "CRANE_GDN_SERIAL_PREFILL",
+            "CRANE_GDN_SERIAL_MAX",
+        ];
+        let saved = keys.into_iter().map(|k| (k, std::env::var_os(k))).collect();
+        for k in keys {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+        Self(saved)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for FlaTestEnv {
+    fn drop(&mut self) {
+        for (k, v) in &self.0 {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn fla_decode_preserves_fallbacks() -> Result<()> {
+    let _env = FlaTestEnv::new();
+    let (dev, _) = gpu();
+    let cfg = Cfg {
+        hidden: 128,
+        k_heads: 1,
+        v_heads: 1,
+    };
+    for dtype in [DType::F16, DType::BF16] {
+        let (gdn, dims) = layer(&dev, &cfg, dtype);
+        let x = rand(&dev, &[1, 1, cfg.hidden], 1.).to_dtype(dtype)?;
+        if dtype == DType::BF16 {
+            unsafe {
+                std::env::set_var("CRANE_GDN_PORTABLE", "1");
+            }
+        }
+        let mut reference = GdnLayerCache::new(&cfg, dtype, &dev)?;
+        let mut actual = GdnLayerCache::new(&cfg, dtype, &dev)?;
+        unsafe {
+            std::env::set_var("CRANE_GDN_FUSED", "0");
+        }
+        let expected = gdn.forward(&x, &dims, &mut reference)?;
+        unsafe {
+            std::env::set_var("CRANE_GDN_FUSED", "1");
+        }
+        assert!(!crane_core::ops::gdn::gdn_fused::supported(&x, &dims));
+        let y = gdn.forward(&x, &dims, &mut actual)?;
+        for (a, b) in [
+            (&y, &expected),
+            (&actual.conv_state, &reference.conv_state),
+            (&actual.recurrent_state, &reference.recurrent_state),
+        ] {
+            assert_eq!(diff(a, b).0, 0);
+        }
+        unsafe {
+            std::env::remove_var("CRANE_GDN_PORTABLE");
+        }
+    }
+    let x = Tensor::zeros((1, 1, cfg.hidden), DType::BF16, &dev)?;
+    let mut dims = GdnDims::new(&cfg);
+    dims.head_k_dim = 64;
+    assert!(!crane_core::ops::gdn::gdn_fused::supported(&x, &dims));
+    dims.head_k_dim = 128;
+    dims.conv_kernel_size = 3;
+    assert!(!crane_core::ops::gdn::gdn_fused::supported(&x, &dims));
+    Ok(())
 }

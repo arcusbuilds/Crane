@@ -776,6 +776,13 @@ explicit serial verification retain the recurrent kernel. `CRANE_GDN_FLA=0`
 restores the legacy arithmetic; `CRANE_GDN_FUSED=0` selects op-by-op preprocessing,
 and `CRANE_GDN_PORTABLE=1` also forces portable recurrence.
 
+For CUDA single-token decode, `CRANE_GDN_FUSED=1` enables fused convolution,
+Q/K/V preparation and gated normalization for batch-one BF16 inputs with
+128-wide heads and a four-tap convolution. In legacy mode (`CRANE_GDN_FLA=0`),
+the convolution-only optimization also supports other head widths. This path is
+opt-in, continues directly from the shared FLA prefill states, and preserves
+current single-token rounding. Multi-token FLA arithmetic is unchanged.
+
 Tests: `cargo test -p crane-core --features cuda --test gdn_fused --test topk_rows -- --ignored`
 (legacy fused vs op chain, plus default FLA state/rollback/decode; use
 `--test-threads=1` for environment-switching tests), `--test dspark_drafter_parity` (vs PyTorch), and
