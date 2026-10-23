@@ -44,3 +44,27 @@ fn batched_topk_matches_per_row() {
         }
     }
 }
+
+/// Greedy decode hands `gpu_argmax` F32 logits on GGUF models and BF16 on
+/// BF16 checkpoints; both must find the largest logit.
+#[test]
+#[ignore = "needs a CUDA, Metal or SYCL GPU"]
+fn gpu_argmax_handles_bf16_and_f32() {
+    #[cfg(feature = "cuda")]
+    let dev = Device::new_cuda(0).unwrap();
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let dev = Device::new_metal(0).unwrap();
+    #[cfg(all(feature = "sycl", not(any(feature = "cuda", feature = "metal"))))]
+    let dev = Device::new_sycl(0).unwrap();
+    let n = 248_094;
+    let noise = Tensor::randn(0f32, 1.0, n, &Device::Cpu).unwrap().to_vec1::<f32>().unwrap();
+    for spike in [0, n / 2, n - 1] {
+        let mut v = noise.clone();
+        v[spike] = 100.0;
+        for dt in [DType::F32, DType::BF16] {
+            let logits = Tensor::from_vec(v.clone(), n, &dev).unwrap().to_dtype(dt).unwrap();
+            let got = crane_core::ops::gpu_argmax(&logits).unwrap();
+            assert_eq!(got as usize, spike, "{dt:?}");
+        }
+    }
+}
