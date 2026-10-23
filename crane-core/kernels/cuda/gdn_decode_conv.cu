@@ -1,16 +1,9 @@
 // Single-token GDN convolution + SiLU. The BF16 kernel preserves the reference's
 // BF16 rounding; the F32 kernel (GGUF decode) rounds nothing through BF16.
 
-#include <cuda_bf16.h>
 #include <math.h>
 
-__device__ __forceinline__ float to_f(float v) { return v; }
-__device__ __forceinline__ float to_f(__nv_bfloat16 v) { return __bfloat162float(v); }
-template <typename T> __device__ __forceinline__ T from_f(float v);
-template <> __device__ __forceinline__ float from_f<float>(float v) { return v; }
-template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) {
-    return __float2bfloat16(v);
-}
+#include "gdn_act.cuh"
 
 template <typename T>
 __device__ void gdn_decode_conv_silu(
