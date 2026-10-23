@@ -304,12 +304,32 @@ pub fn prep_with_numerics(
     }
     let (nea, dt) = (neg_exp_a_log, dt_bias);
     match conv.dtype() {
-        DType::BF16 => {
-            prep_launch::<bf16>(conv, a, b, nea, dt, dims, t0, len, scale, fla_numerics, "gdn_prep_bf16")
-        },
-        DType::F32 => {
-            prep_launch::<f32>(conv, a, b, nea, dt, dims, t0, len, scale, fla_numerics, "gdn_prep_f32")
-        },
+        DType::BF16 => prep_launch::<bf16>(
+            conv,
+            a,
+            b,
+            nea,
+            dt,
+            dims,
+            t0,
+            len,
+            scale,
+            fla_numerics,
+            "gdn_prep_bf16",
+        ),
+        DType::F32 => prep_launch::<f32>(
+            conv,
+            a,
+            b,
+            nea,
+            dt,
+            dims,
+            t0,
+            len,
+            scale,
+            fla_numerics,
+            "gdn_prep_f32",
+        ),
         d => candle_core::bail!("gdn fused prep: unsupported dtype {d:?}"),
     }
 }
@@ -598,7 +618,9 @@ mod decode_conv_tests {
                 let original = f32s(&state)?;
                 let window = Tensor::cat(&[&state.narrow(2, 1, 3)?, &x.reshape((1, c, 1))?], 2)?;
                 let expected = candle_nn::ops::silu(
-                    &window.broadcast_mul(&weight.unsqueeze(0)?)?.sum_keepdim(2)?,
+                    &window
+                        .broadcast_mul(&weight.unsqueeze(0)?)?
+                        .sum_keepdim(2)?,
                 )?
                 .reshape((1, c))?;
                 let out = decode_conv_silu(&x, &state, &weight)?;
@@ -624,7 +646,14 @@ mod decode_conv_tests {
         let weight = Tensor::ones((7, 4), DType::F32, &dev)?;
         assert!(decode_conv_silu(&x, &state.to_dtype(DType::BF16)?, &weight).is_err());
         assert!(decode_conv_silu(&x.to_dtype(DType::BF16)?, &state, &weight).is_err());
-        assert!(decode_conv_silu(&x.to_dtype(DType::F16)?, &state.to_dtype(DType::F16)?, &weight).is_err());
+        assert!(
+            decode_conv_silu(
+                &x.to_dtype(DType::F16)?,
+                &state.to_dtype(DType::F16)?,
+                &weight
+            )
+            .is_err()
+        );
         Ok(())
     }
 
