@@ -1,5 +1,5 @@
-//! Launchers for the fused multi-token GDN stages in
-//! `kernels/cuda/gdn_fused.cu` (bf16 activations, head dim 128, batch 1).
+//! Launchers for the fused GDN stages in `kernels/cuda/gdn_fused.cu` (bf16
+//! activations, or f32 for single-token decode; head dim 128, batch 1).
 //!
 //! Short passes through a GDN layer -- speculative-decoding verification
 //! blocks, prefill chunks -- are dispatch-bound: the op-by-op conv / split /
@@ -83,7 +83,7 @@ fn wrap<T: candle_core::cuda_backend::CudaDType>(
 
 /// Result of [`conv_silu`].
 pub struct ConvOut {
-    /// `[S, C]` bf16, silu already applied.
+    /// `[S, C]` in the input dtype, silu already applied.
     pub y: Tensor,
     /// `[1, C, 4]` conv state after all `S` tokens.
     pub state: Tensor,

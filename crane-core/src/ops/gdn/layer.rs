@@ -478,7 +478,8 @@ impl GatedDeltaNet {
         })
     }
 
-    /// The fused BF16 path on CUDA (decode opt-in), any pass on Metal;
+    /// The fused path on CUDA (BF16, or F32 single-token; decode opt-in),
+    /// any pass on Metal;
     /// `split` is the speculative-decoding checkpoint position
     /// (`0 < p < seq_len`).
     #[cfg(any(feature = "cuda", feature = "metal"))]

@@ -324,6 +324,8 @@ fn real_qwen35_gguf_fused_decode_parity() -> Result<()> {
     for (name, (prefix, step, stats)) in worst {
         println!("worst {name} prefix={prefix} step={step}: {stats:?}");
     }
+    // A silent fallback to the op chain would match bit for bit at every step.
+    assert_eq!(first_flip.len(), 2, "fused decode never ran");
     assert!(failures.is_empty(), "parity gates failed: {failures:?}");
     Ok(())
 }

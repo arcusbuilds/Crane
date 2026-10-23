@@ -515,7 +515,7 @@ fn decode_stages_match_across_steps_and_checkpoints() {
 /// starting from the BF16 conv state that a BF16 prefill leaves behind.
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "needs a CUDA GPU"]
+#[ignore = "needs a CUDA GPU; run with --test-threads=1"]
 fn fused_f32_decode_matches_op_chain() {
     let _env = FlaTestEnv::new();
     use crane_core::ops::gdn::VHeadOrder;
@@ -566,6 +566,7 @@ fn fused_f32_decode_matches_op_chain() {
         }
     }
 }
+
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a CUDA GPU"]
