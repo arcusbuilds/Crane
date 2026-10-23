@@ -207,6 +207,11 @@ pub fn gpu_argmax(logits: &Tensor) -> Result<u32> {
         Device::Cuda(dev) => dev,
         _ => candle_core::bail!("gpu_argmax requires CUDA device"),
     };
+    // The kernel below reads BF16. Other dtypes (F32 logits from GGUF decode)
+    // use candle's device-side argmax, which also reads back only the index.
+    if logits.dtype() != DType::BF16 {
+        return logits.flatten_all()?.argmax(0)?.to_scalar::<u32>();
+    }
 
     let logits = logits.contiguous()?.flatten_all()?;
     let vocab_size = logits.elem_count();
@@ -259,10 +264,11 @@ pub fn gpu_argmax(logits: &Tensor) -> Result<u32> {
         _ => candle_core::bail!("gpu_argmax currently only supports BF16"),
     }
 
-    // Phase 2: reduce block results
+    // Phase 2: reduce block results. Whole warps only: the kernel's cross-warp
+    // step counts blockDim.x / 32 warps, so a partial last warp was dropped.
     let cfg2 = LaunchConfig {
         grid_dim: (1, 1, 1),
-        block_dim: (num_blocks.min(256), 1, 1),
+        block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
 
